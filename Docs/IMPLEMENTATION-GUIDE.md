@@ -510,6 +510,11 @@ convertWorker := NewStageWorker(
 )
 
 // Create store workers (MULTIPLE - can run concurrently)
+// NOTE: Store workers are safe to run concurrently because:
+//   1. Each batch has isolated directory (batches/batch_001/, batch_002/, etc.)
+//   2. Working directory isolation (os.Chdir) ensures no file path conflicts
+//   3. Each worker processes different batch's all_extracted.txt file
+//   4. Database UNIQUE constraint handles duplicate prevention across workers
 storeWorkers := make([]*StageWorker, cfg.MaxStoreWorkers)
 for i := 0; i < cfg.MaxStoreWorkers; i++ {
     storeWorkers[i] = NewStageWorker(
@@ -518,7 +523,7 @@ for i := 0; i < cfg.MaxStoreWorkers; i++ {
         storeQueue,
         nil,  // No output queue (final stage)
         runStoreStage,  // Process function
-        nil,  // No mutex (can run concurrently)
+        nil,  // No mutex (can run concurrently - see note above)
         logger,
     )
 }

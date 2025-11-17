@@ -181,6 +181,136 @@ Time    | Extract Worker | Convert Worker | Store Workers (5)
 
 ---
 
+### Principle 4: Batch Directory Isolation
+
+**Critical Pattern**: Each batch has its own **isolated directory structure** that prevents file conflicts between concurrent workers.
+
+#### Directory Structure
+
+```
+batches/
+├── batch_001/
+│   ├── downloads/                    ← Batch 1's download area
+│   ├── app/extraction/
+│   │   ├── files/
+│   │   │   ├── pass/                ← Batch 1's extracted files
+│   │   │   └── all_extracted.txt    ← Batch 1's converted output
+│   │   └── error/
+│   └── logs/
+├── batch_002/
+│   ├── downloads/                    ← Batch 2's download area
+│   ├── app/extraction/
+│   │   ├── files/
+│   │   │   ├── pass/                ← Batch 2's extracted files
+│   │   │   └── all_extracted.txt    ← Batch 2's converted output
+│   │   └── error/
+│   └── logs/
+└── batch_003/
+    └── ... (same structure)
+```
+
+**Key Insight**: Each batch has its **OWN** `all_extracted.txt` file, not a shared one!
+
+#### Working Directory Pattern
+
+Before executing each stage, the worker **changes the current working directory** to the batch's directory:
+
+```go
+func runConvertStage(ctx context.Context, batch *Batch) error {
+    // Isolate this batch's processing
+    batchRoot := filepath.Join("batches", batch.ID)  // e.g., "batches/batch_001"
+
+    // Save original directory
+    originalWD, err := os.Getwd()
+    if err != nil {
+        return fmt.Errorf("get working directory: %w", err)
+    }
+    defer os.Chdir(originalWD)  // Always restore
+
+    // CRITICAL: Change to batch-specific directory
+    if err := os.Chdir(batchRoot); err != nil {
+        return fmt.Errorf("change to batch directory: %w", err)
+    }
+
+    // Now all relative paths resolve within THIS batch's directory!
+    env := os.Environ()
+    env = append(env, "CONVERT_INPUT_DIR=app/extraction/files/pass")
+    env = append(env, "CONVERT_OUTPUT_FILE=app/extraction/files/all_extracted.txt")
+
+    // This resolves to: batches/batch_001/app/extraction/files/all_extracted.txt
+    // NOT a shared global file!
+
+    cmd := exec.CommandContext(ctx, "go", "run", convertPath)
+    cmd.Dir = batchRoot  // Also set command's working directory
+    cmd.Env = env
+    // ...
+}
+```
+
+#### Why Store Workers Can Run Concurrently
+
+**Question**: If convert.go outputs to `all_extracted.txt`, how can multiple store workers read it in parallel?
+
+**Answer**: Each batch has its **own separate** `all_extracted.txt` file due to directory isolation!
+
+**Data Flow**:
+```
+Time: 36-54 minutes (example from timeline above)
+┌─────────────────────────────────────────────────────────────┐
+│ Extract Worker:  Processing batch_003                       │
+│   Working Dir:   batches/batch_003/                         │
+│   Input:         batches/batch_003/downloads/*.zip          │
+│   Output:        batches/batch_003/app/extraction/files/pass/
+│                                                              │
+│ Convert Worker:  Processing batch_002                       │
+│   Working Dir:   batches/batch_002/                         │
+│   Input:         batches/batch_002/app/extraction/files/pass/
+│   Output:        batches/batch_002/app/extraction/files/all_extracted.txt
+│                                                              │
+│ Store Worker 1:  Processing batch_001                       │
+│   Working Dir:   batches/batch_001/                         │
+│   Input:         batches/batch_001/app/extraction/files/all_extracted.txt
+│   Output:        MySQL Database                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**No Conflicts!** Each worker operates on a **different physical file**.
+
+#### Database Concurrency Safety
+
+Multiple store workers writing to the **same database** is safe because:
+
+1. **Unique Hash Constraint**:
+   ```sql
+   CREATE TABLE lines (
+       id BIGINT AUTO_INCREMENT PRIMARY KEY,
+       line_hash CHAR(32) NOT NULL,
+       content TEXT NOT NULL,
+       UNIQUE KEY idx_unique_hash (line_hash)  -- ← Prevents duplicates
+   );
+   ```
+
+2. **Automatic Duplicate Prevention**:
+   - Worker 1 inserts line with hash `abc123` → Success
+   - Worker 2 tries to insert same line with hash `abc123` → Duplicate key error (ignored)
+   - MySQL's ACID properties ensure data integrity
+
+3. **Connection Pooling**: Each worker gets its own database connection from the pool
+
+**Result**: 5 store workers can safely process different batches' files and write to the same database concurrently.
+
+#### Summary: Why Parallelization is Safe
+
+| Stage | Can Parallelize? | Reason |
+|-------|------------------|--------|
+| **Extract** | ❌ No (mutex) | Architectural constraint: cannot run simultaneously |
+| **Convert** | ❌ No (mutex) | Architectural constraint: cannot run simultaneously |
+| **Store** | ✅ **Yes** | Each batch has isolated input file + database handles concurrency |
+
+**Critical Insight**: The working directory isolation pattern (`os.Chdir`) transforms a seemingly shared path (`app/extraction/files/all_extracted.txt`) into batch-specific physical files, enabling safe concurrent processing.
+
+---
+
 ## Detailed Component Design
 
 ### 1. Stage Queue System
@@ -583,6 +713,15 @@ import (
 
 // runStoreStage executes store.go for a specific batch
 // NOTE: Store stage CAN run concurrently (no mutex needed)
+//
+// WHY SAFE FOR CONCURRENCY:
+// - Each batch has isolated directory: batches/batch_001/, batches/batch_002/, etc.
+// - os.Chdir() changes to batch directory, so relative paths are isolated
+// - Input file "app/extraction/files/all_extracted.txt" resolves to different physical files:
+//   * Batch 1: batches/batch_001/app/extraction/files/all_extracted.txt
+//   * Batch 2: batches/batch_002/app/extraction/files/all_extracted.txt
+// - Database UNIQUE constraint (line_hash) handles duplicate prevention
+// - No file conflicts between workers!
 func runStoreStage(ctx context.Context, batch *Batch) error {
     batchRoot := filepath.Join("batches", batch.ID)
 

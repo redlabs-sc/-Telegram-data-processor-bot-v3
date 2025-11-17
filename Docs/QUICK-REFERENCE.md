@@ -198,7 +198,12 @@ Worker 5 ─┘ a time ✅
 Extract Queue → [Extract Worker] → Convert Queue → [Convert Worker] → Store Queue → [5 Store Workers]
                      ↑                                    ↑                              ↑
                  (1 worker)                          (1 worker)                    (5 concurrent)
-                (has mutex)                         (has mutex)                    (no mutex)
+                (has mutex)                         (has mutex)                    (no mutex*)
+
+*Store workers CAN run concurrently because:
+ - Each batch has isolated directory (batches/batch_001/, batch_002/, etc.)
+ - Working directory isolation (os.Chdir) prevents file conflicts
+ - Database handles duplicate prevention via UNIQUE constraint
 ```
 
 ---
