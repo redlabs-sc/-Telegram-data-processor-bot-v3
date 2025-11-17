@@ -1,8 +1,8 @@
 # Implementation Plan: Option 2 - Batch-Based Parallel Processing System
 ## Telegram Data Processor Bot
 
-**Version**: 1.0
-**Date**: 2025-11-13
+**Version**: 2.0 (Corrected Architecture)
+**Date**: 2025-11-17
 **Estimated Duration**: 12 weeks (3 months)
 **Target Completion**: 2026-02-13
 
@@ -26,32 +26,40 @@
 
 ### 1.1 Implementation Overview
 
-This plan details the step-by-step implementation of **Option 2: Batch-Based Parallel Processing System**, a high-performance architecture that achieves **6× faster processing** compared to the sequential baseline.
+This plan details the step-by-step implementation of **Option 2: Batch-Based Parallel Processing System**, a high-performance architecture that achieves **1.95× faster processing** compared to the sequential baseline.
 
 **Key Characteristics**:
 - **Zero Code Changes**: extract.go, convert.go, store.go remain 100% unchanged
-- **Batch-Based Parallelism**: 5 concurrent batches processing 10 files each
+- **Batch-Based Parallelism**: Batches of 10 files each with stage-level concurrency
+- **Critical Constraint Enforcement**: Extract and convert stages CANNOT run simultaneously (global mutex)
 - **PostgreSQL-Backed Queues**: Persistent, crash-resistant task management
 - **Isolated Workspaces**: Each batch operates in its own directory hierarchy
 - **Working Directory Pattern**: Preserve code by changing `os.Chdir()` before execution
+- **Stage-Specific Workers**: 1 extract worker, 1 convert worker, 5 store workers
 
 ### 1.2 Performance Targets
 
 | Metric | Baseline (Current) | Target (Option 2) | Improvement |
 |--------|-------------------|-------------------|-------------|
-| Processing Time (100 files) | 4.4 hours | 1.7 hours | **6× faster** |
-| Throughput | 23 files/hour | 59 files/hour | **2.6× increase** |
-| Concurrent Processing | Sequential | 5 batches (50 files) | **50× parallelism** |
-| User Notification Delay | 4.4 hours | < 2 hours | **2.4× faster** |
+| Processing Time (100 files) | 4.4 hours | 2.2 hours | **1.95× faster** |
+| Throughput | 23 files/hour | 45 files/hour | **1.96× increase** |
+| Concurrent Processing | Sequential | Stage-based (extract→convert→5×store) | **Constrained parallelism** |
+| User Notification Delay | 4.4 hours | < 2.5 hours | **1.8× faster** |
+| Extract Workers | N/A | 1 (mutex enforced) | **No simultaneous extract** |
+| Convert Workers | N/A | 1 (mutex enforced) | **No simultaneous convert** |
+| Store Workers | N/A | 5 (concurrent safe) | **Batch isolation** |
 
 ### 1.3 Success Criteria
 
-- ✅ Process 100 files in < 2 hours (P95 latency)
+- ✅ Process 100 files in < 2.5 hours (P95 latency)
 - ✅ SHA256 hash match for extract.go, convert.go, store.go (zero modifications)
 - ✅ Zero data loss during crash recovery tests
 - ✅ RAM usage < 20%, CPU usage < 50%
 - ✅ Success rate ≥ 98% over 1000-file test
 - ✅ Admin receives batch notifications within 5 minutes of completion
+- ✅ Global mutex enforces single extract worker constraint
+- ✅ Global mutex enforces single convert worker constraint
+- ✅ Store workers verify batch isolation (no conflicts)
 
 ---
 
@@ -147,7 +155,9 @@ DB_SSL_MODE=disable  # Use 'require' in production
 
 # Worker Configuration
 MAX_DOWNLOAD_WORKERS=3
-MAX_BATCH_WORKERS=5
+MAX_EXTRACT_WORKERS=1  # CRITICAL: Must be 1 (mutex enforced)
+MAX_CONVERT_WORKERS=1  # CRITICAL: Must be 1 (mutex enforced)
+MAX_STORE_WORKERS=5    # Safe to run concurrently (batch isolation)
 BATCH_SIZE=10
 BATCH_TIMEOUT_SEC=300
 
@@ -496,7 +506,9 @@ type Config struct {
 
     // Workers
     MaxDownloadWorkers int
-    MaxBatchWorkers    int
+    MaxExtractWorkers  int  // Must be 1 (mutex enforced)
+    MaxConvertWorkers  int  // Must be 1 (mutex enforced)
+    MaxStoreWorkers    int  // Safe for concurrency (batch isolation)
     BatchSize          int
     BatchTimeoutSec    int
 
@@ -561,9 +573,19 @@ func LoadConfig() (*Config, error) {
 
     // Parse Worker config
     cfg.MaxDownloadWorkers = getEnvInt("MAX_DOWNLOAD_WORKERS", 3)
-    cfg.MaxBatchWorkers = getEnvInt("MAX_BATCH_WORKERS", 5)
+    cfg.MaxExtractWorkers = getEnvInt("MAX_EXTRACT_WORKERS", 1)
+    cfg.MaxConvertWorkers = getEnvInt("MAX_CONVERT_WORKERS", 1)
+    cfg.MaxStoreWorkers = getEnvInt("MAX_STORE_WORKERS", 5)
     cfg.BatchSize = getEnvInt("BATCH_SIZE", 10)
     cfg.BatchTimeoutSec = getEnvInt("BATCH_TIMEOUT_SEC", 300)
+
+    // Validate worker constraints
+    if cfg.MaxExtractWorkers != 1 {
+        return nil, fmt.Errorf("MAX_EXTRACT_WORKERS must be 1 (constraint: extract cannot run concurrently)")
+    }
+    if cfg.MaxConvertWorkers != 1 {
+        return nil, fmt.Errorf("MAX_CONVERT_WORKERS must be 1 (constraint: convert cannot run concurrently)")
+    }
 
     // Parse Timeout config
     cfg.DownloadTimeoutSec = getEnvInt("DOWNLOAD_TIMEOUT_SEC", 1800)
@@ -1197,8 +1219,11 @@ Simply send a file (ZIP, RAR, or TXT) and it will be queued for processing.
 ⚡ Processing Pipeline:
 1. Download (3 concurrent workers)
 2. Batch Formation (10 files per batch)
-3. Extract → Convert → Store (5 concurrent batches)
-4. Notification on completion`
+3. Extract (1 worker, mutex enforced) → Convert (1 worker, mutex enforced) → Store (5 concurrent workers)
+4. Notification on completion
+
+Note: Extract and convert stages cannot run simultaneously due to code constraints.
+Store stage is safe for concurrent execution due to batch directory isolation.`
 
     tr.sendReply(msg.ChatID, text)
 }
@@ -1717,21 +1742,27 @@ func (bc *BatchCoordinator) Start(ctx context.Context) {
 }
 
 func (bc *BatchCoordinator) tryCreateBatch(ctx context.Context) {
-    // Check if we have room for more batches
-    var activeBatches int
+    // Note: We create batches as long as there are files ready.
+    // Stage-specific workers (extract, convert, store) will enforce
+    // their own constraints via mutexes and worker counts.
+    // This allows batches to queue up for processing.
+
+    // Count queued batches (not actively processing yet)
+    var queuedBatches int
     err := bc.db.QueryRowContext(ctx, `
         SELECT COUNT(*)
         FROM batch_processing
-        WHERE status IN ('QUEUED', 'EXTRACTING', 'CONVERTING', 'STORING')
-    `).Scan(&activeBatches)
+        WHERE status = 'QUEUED'
+    `).Scan(&queuedBatches)
 
     if err != nil {
-        bc.logger.Error("Error counting active batches", zap.Error(err))
+        bc.logger.Error("Error counting queued batches", zap.Error(err))
         return
     }
 
-    if activeBatches >= bc.cfg.MaxBatchWorkers {
-        bc.logger.Debug("Max batch workers reached", zap.Int("active", activeBatches))
+    // Limit queue depth to prevent overwhelming the system
+    if queuedBatches >= 20 {
+        bc.logger.Debug("Too many queued batches", zap.Int("queued", queuedBatches))
         return
     }
 
@@ -1980,15 +2011,17 @@ PGPASSWORD=change_me_in_production psql -U bot_user -h localhost -d telegram_bot
 PGPASSWORD=change_me_in_production psql -U bot_user -h localhost -d telegram_bot_option2 -c "SELECT batch_id, file_count FROM batch_processing WHERE file_count < 10;"
 ```
 
-**Test 3.3: Max Concurrent Batches**
+**Test 3.3: Batch Queue Formation**
 
 ```bash
-# Set MAX_BATCH_WORKERS=2 in .env
 # Upload 30 files (should create 3 batches of 10)
 
-# Start processing workers (will implement in Phase 4)
-# Verify only 2 batches are QUEUED/PROCESSING at a time
-watch -n 2 'PGPASSWORD=change_me_in_production psql -U bot_user -h localhost -d telegram_bot_option2 -c "SELECT batch_id, status FROM batch_processing WHERE status != '\''COMPLETED'\'' ORDER BY created_at;"'
+# Verify batches are created and queued
+watch -n 2 'PGPASSWORD=change_me_in_production psql -U bot_user -h localhost -d telegram_bot_option2 -c "SELECT batch_id, status FROM batch_processing ORDER BY created_at;"'
+
+# Note: All batches may be QUEUED initially. Stage-specific workers
+# (1 extract, 1 convert, 5 store) will process them sequentially
+# through extract/convert stages, then concurrently through store stage.
 ```
 
 **Phase 3 Completion Checklist**:
@@ -1999,7 +2032,7 @@ watch -n 2 'PGPASSWORD=change_me_in_production psql -U bot_user -h localhost -d 
 - ✅ Archives go to all/, TXT files go to txt/
 - ✅ pass.txt copied to each batch
 - ✅ Database records created (batch_processing, batch_files)
-- ✅ Max concurrent batches enforced
+- ✅ Batch queue depth limited (prevents overwhelming system)
 
 ---
 

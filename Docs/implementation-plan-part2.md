@@ -23,17 +23,55 @@
 ## Phase 4: Batch Processing Workers (Week 7-8)
 
 ### Objectives
-- Implement batch worker pool (5 concurrent workers)
-- Execute extract → convert → store pipeline sequentially per batch
+- Implement stage-specific worker pools (1 extract, 1 convert, 5 store workers)
+- Enforce global mutex for extract and convert stages (CANNOT run simultaneously)
+- Execute extract → convert → store pipeline with stage-level concurrency
 - Use working directory changes to preserve code 100%
+- Leverage batch directory isolation for safe concurrent store operations
 - Handle batch failures and logging
 - Notify admin on batch completion
 
+### Architecture Constraints
+**CRITICAL**: Extract and convert stages cannot run simultaneously due to code limitations.
+- **Extract Worker**: Only 1 instance allowed (enforced via global mutex)
+- **Convert Worker**: Only 1 instance allowed (enforced via global mutex)
+- **Store Workers**: 5 concurrent instances safe (each batch has isolated directories)
+
 ---
 
-### Task 4.1: Batch Worker Implementation
+### Task 4.1: Global Mutex for Stage Enforcement
 
-**File**: `coordinator/batch_worker.go`
+**File**: `coordinator/stage_mutex.go`
+
+```go
+package main
+
+import (
+    "sync"
+)
+
+// Global mutexes to enforce single-instance constraints
+// CRITICAL: Extract and convert cannot run simultaneously
+var (
+    extractMutex sync.Mutex
+    convertMutex sync.Mutex
+)
+
+// StageType represents the processing stage
+type StageType string
+
+const (
+    StageExtract  StageType = "EXTRACTING"
+    StageConvert  StageType = "CONVERTING"
+    StageStore    StageType = "STORING"
+)
+```
+
+---
+
+### Task 4.2: Extract Worker Implementation
+
+**File**: `coordinator/extract_worker.go`
 
 ```go
 package main
@@ -50,15 +88,15 @@ import (
     "go.uber.org/zap"
 )
 
-type BatchWorker struct {
+type ExtractWorker struct {
     id     string
     cfg    *Config
     db     *sql.DB
     logger *zap.Logger
 }
 
-func NewBatchWorker(id string, cfg *Config, db *sql.DB, logger *zap.Logger) *BatchWorker {
-    return &BatchWorker{
+func NewExtractWorker(id string, cfg *Config, db *sql.DB, logger *zap.Logger) *ExtractWorker {
+    return &ExtractWorker{
         id:     id,
         cfg:    cfg,
         db:     db,
@@ -66,8 +104,8 @@ func NewBatchWorker(id string, cfg *Config, db *sql.DB, logger *zap.Logger) *Bat
     }
 }
 
-func (bw *BatchWorker) Start(ctx context.Context) {
-    bw.logger.Info("Batch worker started")
+func (ew *ExtractWorker) Start(ctx context.Context) {
+    ew.logger.Info("Extract worker started (CRITICAL: Only 1 instance allowed)")
 
     ticker := time.NewTicker(10 * time.Second)
     defer ticker.Stop()
@@ -75,41 +113,48 @@ func (bw *BatchWorker) Start(ctx context.Context) {
     for {
         select {
         case <-ctx.Done():
-            bw.logger.Info("Batch worker stopping")
+            ew.logger.Info("Extract worker stopping")
             return
         case <-ticker.C:
-            bw.processNext(ctx)
+            ew.processNext(ctx)
         }
     }
 }
 
-func (bw *BatchWorker) processNext(ctx context.Context) {
-    // Claim next queued batch with optimistic locking
-    tx, err := bw.db.BeginTx(ctx, nil)
+func (ew *ExtractWorker) processNext(ctx context.Context) {
+    // CRITICAL: Acquire global extract mutex
+    // Only ONE extract operation can run at a time across ALL batches
+    extractMutex.Lock()
+    defer extractMutex.Unlock()
+
+    ew.logger.Debug("Acquired extract mutex, claiming batch")
+
+    // Claim next queued batch with archives
+    tx, err := ew.db.BeginTx(ctx, nil)
     if err != nil {
-        bw.logger.Error("Error starting transaction", zap.Error(err))
+        ew.logger.Error("Error starting transaction", zap.Error(err))
         return
     }
     defer tx.Rollback()
 
     var batchID string
-    var fileCount, archiveCount, txtCount int
+    var archiveCount int
 
     err = tx.QueryRowContext(ctx, `
-        SELECT batch_id, file_count, archive_count, txt_count
+        SELECT batch_id, archive_count
         FROM batch_processing
-        WHERE status = 'QUEUED'
+        WHERE status = 'QUEUED' AND archive_count > 0
         ORDER BY created_at ASC
         LIMIT 1
         FOR UPDATE SKIP LOCKED
-    `).Scan(&batchID, &fileCount, &archiveCount, &txtCount)
+    `).Scan(&batchID, &archiveCount)
 
     if err == sql.ErrNoRows {
-        // No queued batches
+        // No batches with archives to extract
         return
     }
     if err != nil {
-        bw.logger.Error("Error querying batch", zap.Error(err))
+        ew.logger.Error("Error querying batch", zap.Error(err))
         return
     }
 
@@ -120,58 +165,35 @@ func (bw *BatchWorker) processNext(ctx context.Context) {
             worker_id = $2,
             started_at = NOW()
         WHERE batch_id = $1
-    `, batchID, bw.id)
+    `, batchID, ew.id)
 
     if err != nil {
-        bw.logger.Error("Error updating batch status", zap.Error(err))
+        ew.logger.Error("Error updating batch status", zap.Error(err))
         return
     }
 
     if err := tx.Commit(); err != nil {
-        bw.logger.Error("Error committing transaction", zap.Error(err))
+        ew.logger.Error("Error committing transaction", zap.Error(err))
         return
     }
 
-    bw.logger.Info("Claimed batch",
+    ew.logger.Info("Processing extract stage",
         zap.String("batch_id", batchID),
-        zap.Int("file_count", fileCount),
-        zap.Int("archive_count", archiveCount),
-        zap.Int("txt_count", txtCount))
+        zap.Int("archive_count", archiveCount))
 
-    // Process batch through pipeline
-    if err := bw.processBatch(ctx, batchID, archiveCount, txtCount); err != nil {
-        bw.logger.Error("Batch processing failed",
-            zap.String("batch_id", batchID),
-            zap.Error(err))
-
-        // Mark as FAILED
-        bw.db.Exec(`
-            UPDATE batch_processing
-            SET status = 'FAILED',
-                error_message = $2,
-                completed_at = NOW()
-            WHERE batch_id = $1
-        `, batchID, err.Error())
-
-        // TODO: Notify admin of failure
+    // Run extract stage
+    if err := ew.runExtractStage(ctx, batchID); err != nil {
+        ew.logger.Error("Extract failed", zap.String("batch_id", batchID), zap.Error(err))
+        ew.db.Exec(`UPDATE batch_processing SET status='FAILED', error_message=$2 WHERE batch_id=$1`,
+            batchID, err.Error())
     } else {
-        bw.logger.Info("Batch completed successfully",
-            zap.String("batch_id", batchID))
-
-        // Mark as COMPLETED
-        bw.db.Exec(`
-            UPDATE batch_processing
-            SET status = 'COMPLETED',
-                completed_at = NOW()
-            WHERE batch_id = $1
-        `, batchID)
-
-        // TODO: Notify admin of completion
-        // TODO: Cleanup batch directory
+        // Move to CONVERTING status (for convert worker to pick up)
+        ew.db.Exec(`UPDATE batch_processing SET status='PENDING_CONVERT' WHERE batch_id=$1`, batchID)
+        ew.logger.Info("Extract completed", zap.String("batch_id", batchID))
     }
 }
 
-func (bw *BatchWorker) processBatch(ctx context.Context, batchID string, archiveCount, txtCount int) error {
+func (ew *ExtractWorker) runExtractStage(ctx context.Context, batchID string) error {
     batchRoot := filepath.Join("batches", batchID)
 
     // Save current working directory
@@ -186,60 +208,18 @@ func (bw *BatchWorker) processBatch(ctx context.Context, batchID string, archive
         return fmt.Errorf("change to batch directory: %w", err)
     }
 
-    bw.logger.Info("Changed working directory",
-        zap.String("batch_id", batchID),
-        zap.String("wd", batchRoot))
-
-    // STAGE 1: Extract (only if archives exist)
-    if archiveCount > 0 {
-        if err := bw.runExtractStage(ctx, batchID); err != nil {
-            return fmt.Errorf("extract stage: %w", err)
-        }
-    } else {
-        bw.logger.Info("Skipping extract stage (no archives)",
-            zap.String("batch_id", batchID))
-    }
-
-    // STAGE 2: Convert (only if archives were extracted)
-    if archiveCount > 0 {
-        if err := bw.runConvertStage(ctx, batchID); err != nil {
-            return fmt.Errorf("convert stage: %w", err)
-        }
-    } else {
-        bw.logger.Info("Skipping convert stage (no archives)",
-            zap.String("batch_id", batchID))
-    }
-
-    // STAGE 3: Store (processes both converted output and direct TXT files)
-    if err := bw.runStoreStage(ctx, batchID); err != nil {
-        return fmt.Errorf("store stage: %w", err)
-    }
-
-    return nil
-}
-
-func (bw *BatchWorker) runExtractStage(ctx context.Context, batchID string) error {
-    bw.logger.Info("Starting extract stage", zap.String("batch_id", batchID))
-
-    // Update status
-    bw.db.Exec(`
-        UPDATE batch_processing
-        SET status = 'EXTRACTING'
-        WHERE batch_id = $1
-    `, batchID)
-
     startTime := time.Now()
 
-    // Build path to extract.go (relative to batch root)
-    extractPath := filepath.Join(bw.cfg.GetProjectRoot(), "app", "extraction", "extract", "extract.go")
+    // Build path to extract.go (absolute path to preserved code)
+    extractPath := filepath.Join(ew.cfg.GetProjectRoot(), "app", "extraction", "extract", "extract.go")
 
     // Create context with timeout
-    extractCtx, cancel := context.WithTimeout(ctx, time.Duration(bw.cfg.ExtractTimeoutSec)*time.Second)
+    extractCtx, cancel := context.WithTimeout(ctx, time.Duration(ew.cfg.ExtractTimeoutSec)*time.Second)
     defer cancel()
 
     // Execute extract.go as subprocess
-    // CRITICAL: Working directory is already batch root, so extract.go will process
-    // the files in batches/{batch_id}/app/extraction/files/all/
+    // CRITICAL: Working directory is batch root, so extract.go processes
+    // files in batches/{batch_id}/app/extraction/files/all/
     cmd := exec.CommandContext(extractCtx, "go", "run", extractPath)
     output, err := cmd.CombinedOutput()
 
@@ -250,7 +230,7 @@ func (bw *BatchWorker) runExtractStage(ctx context.Context, batchID string) erro
     duration := time.Since(startTime)
 
     if err != nil {
-        bw.logger.Error("Extract stage failed",
+        ew.logger.Error("Extract stage failed",
             zap.String("batch_id", batchID),
             zap.Duration("duration", duration),
             zap.Error(err))
@@ -258,36 +238,164 @@ func (bw *BatchWorker) runExtractStage(ctx context.Context, batchID string) erro
     }
 
     // Store duration in database
-    bw.db.Exec(`
+    ew.db.Exec(`
         UPDATE batch_processing
         SET extract_duration_sec = $2
         WHERE batch_id = $1
     `, batchID, int(duration.Seconds()))
 
-    bw.logger.Info("Extract stage completed",
+    ew.logger.Info("Extract stage completed",
         zap.String("batch_id", batchID),
         zap.Duration("duration", duration))
 
     return nil
 }
+```
 
-func (bw *BatchWorker) runConvertStage(ctx context.Context, batchID string) error {
-    bw.logger.Info("Starting convert stage", zap.String("batch_id", batchID))
+---
 
-    // Update status
-    bw.db.Exec(`
+### Task 4.3: Convert Worker Implementation
+
+**File**: `coordinator/convert_worker.go`
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "os"
+    "os/exec"
+    "path/filepath"
+    "time"
+
+    "go.uber.org/zap"
+)
+
+type ConvertWorker struct {
+    id     string
+    cfg    *Config
+    db     *sql.DB
+    logger *zap.Logger
+}
+
+func NewConvertWorker(id string, cfg *Config, db *sql.DB, logger *zap.Logger) *ConvertWorker {
+    return &ConvertWorker{
+        id:     id,
+        cfg:    cfg,
+        db:     db,
+        logger: logger.With(zap.String("worker", id)),
+    }
+}
+
+func (cw *ConvertWorker) Start(ctx context.Context) {
+    cw.logger.Info("Convert worker started (CRITICAL: Only 1 instance allowed)")
+
+    ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            cw.logger.Info("Convert worker stopping")
+            return
+        case <-ticker.C:
+            cw.processNext(ctx)
+        }
+    }
+}
+
+func (cw *ConvertWorker) processNext(ctx context.Context) {
+    // CRITICAL: Acquire global convert mutex
+    // Only ONE convert operation can run at a time across ALL batches
+    convertMutex.Lock()
+    defer convertMutex.Unlock()
+
+    cw.logger.Debug("Acquired convert mutex, claiming batch")
+
+    // Claim next batch ready for converting
+    tx, err := cw.db.BeginTx(ctx, nil)
+    if err != nil {
+        cw.logger.Error("Error starting transaction", zap.Error(err))
+        return
+    }
+    defer tx.Rollback()
+
+    var batchID string
+
+    err = tx.QueryRowContext(ctx, `
+        SELECT batch_id
+        FROM batch_processing
+        WHERE status = 'PENDING_CONVERT'
+        ORDER BY created_at ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+    `).Scan(&batchID)
+
+    if err == sql.ErrNoRows {
+        // No batches ready for convert
+        return
+    }
+    if err != nil {
+        cw.logger.Error("Error querying batch", zap.Error(err))
+        return
+    }
+
+    // Mark as CONVERTING
+    _, err = tx.ExecContext(ctx, `
         UPDATE batch_processing
-        SET status = 'CONVERTING'
+        SET status = 'CONVERTING',
+            worker_id = $2
         WHERE batch_id = $1
-    `, batchID)
+    `, batchID, cw.id)
+
+    if err != nil {
+        cw.logger.Error("Error updating batch status", zap.Error(err))
+        return
+    }
+
+    if err := tx.Commit(); err != nil {
+        cw.logger.Error("Error committing transaction", zap.Error(err))
+        return
+    }
+
+    cw.logger.Info("Processing convert stage", zap.String("batch_id", batchID))
+
+    // Run convert stage
+    if err := cw.runConvertStage(ctx, batchID); err != nil {
+        cw.logger.Error("Convert failed", zap.String("batch_id", batchID), zap.Error(err))
+        cw.db.Exec(`UPDATE batch_processing SET status='FAILED', error_message=$2 WHERE batch_id=$1`,
+            batchID, err.Error())
+    } else {
+        // Move to STORING status (for store workers to pick up)
+        cw.db.Exec(`UPDATE batch_processing SET status='PENDING_STORE' WHERE batch_id=$1`, batchID)
+        cw.logger.Info("Convert completed", zap.String("batch_id", batchID))
+    }
+}
+
+func (cw *ConvertWorker) runConvertStage(ctx context.Context, batchID string) error {
+    batchRoot := filepath.Join("batches", batchID)
+
+    // Save current working directory
+    originalWD, err := os.Getwd()
+    if err != nil {
+        return fmt.Errorf("get working directory: %w", err)
+    }
+    defer os.Chdir(originalWD)
+
+    // Change to batch directory
+    if err := os.Chdir(batchRoot); err != nil {
+        return fmt.Errorf("change to batch directory: %w", err)
+    }
 
     startTime := time.Now()
 
     // Build path to convert.go
-    convertPath := filepath.Join(bw.cfg.GetProjectRoot(), "app", "extraction", "convert", "convert.go")
+    convertPath := filepath.Join(cw.cfg.GetProjectRoot(), "app", "extraction", "convert", "convert.go")
 
     // Create context with timeout
-    convertCtx, cancel := context.WithTimeout(ctx, time.Duration(bw.cfg.ConvertTimeoutSec)*time.Second)
+    convertCtx, cancel := context.WithTimeout(ctx, time.Duration(cw.cfg.ConvertTimeoutSec)*time.Second)
     defer cancel()
 
     // Set environment variables for convert.go
@@ -307,7 +415,7 @@ func (bw *BatchWorker) runConvertStage(ctx context.Context, batchID string) erro
     duration := time.Since(startTime)
 
     if err != nil {
-        bw.logger.Error("Convert stage failed",
+        cw.logger.Error("Convert stage failed",
             zap.String("batch_id", batchID),
             zap.Duration("duration", duration),
             zap.Error(err))
@@ -315,42 +423,168 @@ func (bw *BatchWorker) runConvertStage(ctx context.Context, batchID string) erro
     }
 
     // Store duration
-    bw.db.Exec(`
+    cw.db.Exec(`
         UPDATE batch_processing
         SET convert_duration_sec = $2
         WHERE batch_id = $1
     `, batchID, int(duration.Seconds()))
 
-    bw.logger.Info("Convert stage completed",
+    cw.logger.Info("Convert stage completed",
         zap.String("batch_id", batchID),
         zap.Duration("duration", duration))
 
     return nil
 }
+```
 
-func (bw *BatchWorker) runStoreStage(ctx context.Context, batchID string) error {
-    bw.logger.Info("Starting store stage", zap.String("batch_id", batchID))
+---
 
-    // Update status
-    bw.db.Exec(`
+### Task 4.4: Store Worker Implementation
+
+**File**: `coordinator/store_worker.go`
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "os"
+    "os/exec"
+    "path/filepath"
+    "time"
+
+    "go.uber.org/zap"
+)
+
+type StoreWorker struct {
+    id     string
+    cfg    *Config
+    db     *sql.DB
+    logger *zap.Logger
+}
+
+func NewStoreWorker(id string, cfg *Config, db *sql.DB, logger *zap.Logger) *StoreWorker {
+    return &StoreWorker{
+        id:     id,
+        cfg:    cfg,
+        db:     db,
+        logger: logger.With(zap.String("worker", id)),
+    }
+}
+
+func (sw *StoreWorker) Start(ctx context.Context) {
+    sw.logger.Info("Store worker started (5 instances safe - batch isolation)")
+
+    ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            sw.logger.Info("Store worker stopping")
+            return
+        case <-ticker.C:
+            sw.processNext(ctx)
+        }
+    }
+}
+
+func (sw *StoreWorker) processNext(ctx context.Context) {
+    // NO MUTEX NEEDED: Each batch has isolated directories
+    // Safe for concurrent execution across different batches
+
+    // Claim next batch ready for storing
+    tx, err := sw.db.BeginTx(ctx, nil)
+    if err != nil {
+        sw.logger.Error("Error starting transaction", zap.Error(err))
+        return
+    }
+    defer tx.Rollback()
+
+    var batchID string
+
+    // Also handle batches that skipped extract/convert (txt-only batches)
+    err = tx.QueryRowContext(ctx, `
+        SELECT batch_id
+        FROM batch_processing
+        WHERE status IN ('PENDING_STORE', 'QUEUED')
+          AND (txt_count > 0 OR status = 'PENDING_STORE')
+        ORDER BY created_at ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+    `).Scan(&batchID)
+
+    if err == sql.ErrNoRows {
+        return
+    }
+    if err != nil {
+        sw.logger.Error("Error querying batch", zap.Error(err))
+        return
+    }
+
+    // Mark as STORING
+    _, err = tx.ExecContext(ctx, `
         UPDATE batch_processing
-        SET status = 'STORING'
+        SET status = 'STORING',
+            worker_id = $2
         WHERE batch_id = $1
-    `, batchID)
+    `, batchID, sw.id)
+
+    if err != nil {
+        sw.logger.Error("Error updating batch status", zap.Error(err))
+        return
+    }
+
+    if err := tx.Commit(); err != nil {
+        sw.logger.Error("Error committing transaction", zap.Error(err))
+        return
+    }
+
+    sw.logger.Info("Processing store stage", zap.String("batch_id", batchID))
+
+    // Run store stage
+    if err := sw.runStoreStage(ctx, batchID); err != nil {
+        sw.logger.Error("Store failed", zap.String("batch_id", batchID), zap.Error(err))
+        sw.db.Exec(`UPDATE batch_processing SET status='FAILED', error_message=$2, completed_at=NOW() WHERE batch_id=$1`,
+            batchID, err.Error())
+    } else {
+        // Mark as COMPLETED
+        sw.db.Exec(`UPDATE batch_processing SET status='COMPLETED', completed_at=NOW() WHERE batch_id=$1`, batchID)
+        sw.logger.Info("Store completed - batch finished", zap.String("batch_id", batchID))
+    }
+}
+
+func (sw *StoreWorker) runStoreStage(ctx context.Context, batchID string) error {
+    batchRoot := filepath.Join("batches", batchID)
+
+    // Save current working directory
+    originalWD, err := os.Getwd()
+    if err != nil {
+        return fmt.Errorf("get working directory: %w", err)
+    }
+    defer os.Chdir(originalWD)
+
+    // Change to batch directory
+    if err := os.Chdir(batchRoot); err != nil {
+        return fmt.Errorf("change to batch directory: %w", err)
+    }
 
     startTime := time.Now()
 
     // Build path to store.go
-    storePath := filepath.Join(bw.cfg.GetProjectRoot(), "app", "extraction", "store.go")
+    storePath := filepath.Join(sw.cfg.GetProjectRoot(), "app", "extraction", "store.go")
 
     // Create context with timeout
-    storeCtx, cancel := context.WithTimeout(ctx, time.Duration(bw.cfg.StoreTimeoutSec)*time.Second)
+    storeCtx, cancel := context.WithTimeout(ctx, time.Duration(sw.cfg.StoreTimeoutSec)*time.Second)
     defer cancel()
 
     // Execute store.go as subprocess
     // Store.go will process:
     // 1. Converted output from app/extraction/files/all_extracted.txt
     // 2. Direct TXT files from app/extraction/files/txt/
+    // SAFE for concurrent execution: Each batch has isolated directories
     cmd := exec.CommandContext(storeCtx, "go", "run", storePath)
     output, err := cmd.CombinedOutput()
 
@@ -361,7 +595,7 @@ func (bw *BatchWorker) runStoreStage(ctx context.Context, batchID string) error 
     duration := time.Since(startTime)
 
     if err != nil {
-        bw.logger.Error("Store stage failed",
+        sw.logger.Error("Store stage failed",
             zap.String("batch_id", batchID),
             zap.Duration("duration", duration),
             zap.Error(err))
@@ -369,13 +603,13 @@ func (bw *BatchWorker) runStoreStage(ctx context.Context, batchID string) error 
     }
 
     // Store duration
-    bw.db.Exec(`
+    sw.db.Exec(`
         UPDATE batch_processing
         SET store_duration_sec = $2
         WHERE batch_id = $1
     `, batchID, int(duration.Seconds()))
 
-    bw.logger.Info("Store stage completed",
+    sw.logger.Info("Store stage completed",
         zap.String("batch_id", batchID),
         zap.Duration("duration", duration))
 
@@ -396,9 +630,9 @@ func (c *Config) GetProjectRoot() string {
 
 ---
 
-### Task 4.2: Update Main Entry Point
+### Task 4.5: Update Main Entry Point
 
-Update `coordinator/main.go` to start batch coordinator and batch workers:
+Update `coordinator/main.go` to start batch coordinator and stage-specific workers:
 
 ```go
 // Add after download workers (after line 1578)
@@ -408,22 +642,40 @@ batchCoordinator := NewBatchCoordinator(cfg, db, logger)
 go batchCoordinator.Start(ctx)
 logger.Info("Batch coordinator started")
 
-// 10. Start batch workers
-for i := 1; i <= cfg.MaxBatchWorkers; i++ {
-    workerID := fmt.Sprintf("batch_worker_%d", i)
-    worker := NewBatchWorker(workerID, cfg, db, logger)
+// 10. Start EXTRACT workers (exactly 1, with mutex)
+for i := 1; i <= cfg.MaxExtractWorkers; i++ {
+    workerID := fmt.Sprintf("extract_worker_%d", i)
+    worker := NewExtractWorker(workerID, cfg, db, logger)
     go worker.Start(ctx)
-    logger.Info("Batch worker started", zap.String("id", workerID))
+    logger.Info("Extract worker started", zap.String("id", workerID))
+}
+
+// 11. Start CONVERT workers (exactly 1, with mutex)
+for i := 1; i <= cfg.MaxConvertWorkers; i++ {
+    workerID := fmt.Sprintf("convert_worker_%d", i)
+    worker := NewConvertWorker(workerID, cfg, db, logger)
+    go worker.Start(ctx)
+    logger.Info("Convert worker started", zap.String("id", workerID))
+}
+
+// 12. Start STORE workers (5 concurrent, batch isolation)
+for i := 1; i <= cfg.MaxStoreWorkers; i++ {
+    workerID := fmt.Sprintf("store_worker_%d", i)
+    worker := NewStoreWorker(workerID, cfg, db, logger)
+    go worker.Start(ctx)
+    logger.Info("Store worker started", zap.String("id", workerID))
 }
 
 logger.Info("All services started successfully",
     zap.Int("download_workers", cfg.MaxDownloadWorkers),
-    zap.Int("batch_workers", cfg.MaxBatchWorkers))
+    zap.Int("extract_workers", cfg.MaxExtractWorkers),
+    zap.Int("convert_workers", cfg.MaxConvertWorkers),
+    zap.Int("store_workers", cfg.MaxStoreWorkers))
 ```
 
 ---
 
-### Task 4.3: Batch Cleanup Service
+### Task 4.6: Batch Cleanup Service
 
 **File**: `coordinator/batch_cleanup.go`
 
@@ -600,16 +852,25 @@ watch -n 2 'PGPASSWORD=change_me_in_production psql -U bot_user -h localhost -d 
 ls -lh batches/batch_002/app/extraction/files/txt/
 ```
 
-**Test 4.3: Concurrent Batch Processing**
+**Test 4.3: Stage-Level Concurrency**
 
 ```bash
 # Upload 50 archive files (should create 5 batches)
 
-# Monitor concurrent processing
-watch -n 2 'PGPASSWORD=change_me_in_production psql -U bot_user -h localhost -d telegram_bot_option2 -c "SELECT batch_id, status, worker_id FROM batch_processing WHERE status IN ('\''EXTRACTING'\'', '\''CONVERTING'\'', '\''STORING'\'') ORDER BY created_at;"'
+# Monitor stage processing
+watch -n 2 'PGPASSWORD=change_me_in_production psql -U bot_user -h localhost -d telegram_bot_option2 -c "SELECT batch_id, status, worker_id FROM batch_processing WHERE status IN ('\''EXTRACTING'\'', '\''CONVERTING'\'', '\''STORING'\'', '\''PENDING_CONVERT'\'', '\''PENDING_STORE'\'') ORDER BY created_at;"'
 
-# Expected: Maximum 5 batches processing concurrently (MAX_BATCH_WORKERS=5)
-# Each batch assigned to different worker_id
+# Expected constraints:
+# - Only 1 batch in EXTRACTING status at any time
+# - Only 1 batch in CONVERTING status at any time
+# - Up to 5 batches in STORING status concurrently
+# - worker_id shows extract_worker_1, convert_worker_1, store_worker_1-5
+
+# Verify mutex enforcement
+# At any moment:
+# - EXTRACTING count = 0 or 1 (never > 1)
+# - CONVERTING count = 0 or 1 (never > 1)
+# - STORING count = 0 to 5 (can be up to 5)
 ```
 
 **Test 4.4: Code Preservation Verification**
@@ -629,16 +890,20 @@ diff <(sha256sum app/extraction/store.go) <(grep store.go checksums.txt)
 ```
 
 **Phase 4 Completion Checklist**:
-- ✅ Batch workers claim and process batches
-- ✅ Extract → Convert → Store pipeline executes sequentially
+- ✅ Extract worker (1 instance) with global mutex enforcement
+- ✅ Convert worker (1 instance) with global mutex enforcement
+- ✅ Store workers (5 instances) with batch isolation
+- ✅ Extract stage: Only 1 batch processes at a time (mutex verified)
+- ✅ Convert stage: Only 1 batch processes at a time (mutex verified)
+- ✅ Store stage: Up to 5 batches process concurrently (batch isolation verified)
 - ✅ Working directory changed to batch root before execution
 - ✅ Extract.go, convert.go, store.go remain 100% unchanged (checksum verified)
 - ✅ Batch logs written to batch-specific log files
-- ✅ Duration metrics recorded in database
+- ✅ Duration metrics recorded in database for each stage
 - ✅ Failed batches marked with error messages
 - ✅ Completed batches cleaned up after retention period
 - ✅ Failed batches archived for 7 days
-- ✅ Maximum 5 concurrent batches enforced
+- ✅ Stage-specific worker counts enforced (config validation)
 
 ---
 
@@ -840,10 +1105,12 @@ func (tr *TelegramReceiver) handleStats(msg *tgbotapi.Message) {
 
     throughput := float64(filesProcessed) / 24.0 // files per hour
 
-    // Current load
-    var downloadWorkers, batchWorkers, queueSize int
+    // Current load by stage
+    var downloadWorkers, extractWorkers, convertWorkers, storeWorkers, queueSize int
     tr.db.QueryRow("SELECT COUNT(*) FROM download_queue WHERE status='DOWNLOADING'").Scan(&downloadWorkers)
-    tr.db.QueryRow("SELECT COUNT(*) FROM batch_processing WHERE status IN ('EXTRACTING', 'CONVERTING', 'STORING')").Scan(&batchWorkers)
+    tr.db.QueryRow("SELECT COUNT(*) FROM batch_processing WHERE status='EXTRACTING'").Scan(&extractWorkers)
+    tr.db.QueryRow("SELECT COUNT(*) FROM batch_processing WHERE status='CONVERTING'").Scan(&convertWorkers)
+    tr.db.QueryRow("SELECT COUNT(*) FROM batch_processing WHERE status='STORING'").Scan(&storeWorkers)
     tr.db.QueryRow("SELECT COUNT(*) FROM download_queue WHERE status='PENDING'").Scan(&queueSize)
 
     text := fmt.Sprintf(`📈 *System Statistics* (Last 24 Hours)
@@ -856,11 +1123,15 @@ func (tr *TelegramReceiver) handleStats(msg *tgbotapi.Message) {
 
 *Current Load*:
 • Download Workers: %d/%d active
-• Batch Workers: %d/%d active
+• Extract Stage: %d/1 active (mutex enforced)
+• Convert Stage: %d/1 active (mutex enforced)
+• Store Stage: %d/%d active (batch isolation)
 • Queue Size: %d pending`,
         totalProcessed, filesProcessed, successRate, avgDuration/60, throughput,
         downloadWorkers, tr.cfg.MaxDownloadWorkers,
-        batchWorkers, tr.cfg.MaxBatchWorkers,
+        extractWorkers,
+        convertWorkers,
+        storeWorkers, tr.cfg.MaxStoreWorkers,
         queueSize)
 
     tr.sendReply(msg.ChatID, text)
@@ -878,10 +1149,23 @@ func (tr *TelegramReceiver) handleHealthCommand(msg *tgbotapi.Message) {
     tr.db.QueryRow("SELECT COUNT(*) FROM download_queue WHERE status='DOWNLOADING'").Scan(&activeDownloads)
     downloadStatus := fmt.Sprintf("✅ %d/%d active", activeDownloads, tr.cfg.MaxDownloadWorkers)
 
-    // Check batch workers
-    var activeBatches int
-    tr.db.QueryRow("SELECT COUNT(*) FROM batch_processing WHERE status IN ('EXTRACTING', 'CONVERTING', 'STORING')").Scan(&activeBatches)
-    batchStatus := fmt.Sprintf("✅ %d/%d active", activeBatches, tr.cfg.MaxBatchWorkers)
+    // Check stage-specific workers
+    var extracting, converting, storing int
+    tr.db.QueryRow("SELECT COUNT(*) FROM batch_processing WHERE status='EXTRACTING'").Scan(&extracting)
+    tr.db.QueryRow("SELECT COUNT(*) FROM batch_processing WHERE status='CONVERTING'").Scan(&converting)
+    tr.db.QueryRow("SELECT COUNT(*) FROM batch_processing WHERE status='STORING'").Scan(&storing)
+
+    extractStatus := fmt.Sprintf("✅ %d/1 active (mutex)", extracting)
+    convertStatus := fmt.Sprintf("✅ %d/1 active (mutex)", converting)
+    storeStatus := fmt.Sprintf("✅ %d/%d active (isolated)", storing, tr.cfg.MaxStoreWorkers)
+
+    // Verify mutex constraints
+    if extracting > 1 {
+        extractStatus = fmt.Sprintf("❌ %d/1 active (MUTEX VIOLATION!)", extracting)
+    }
+    if converting > 1 {
+        convertStatus = fmt.Sprintf("❌ %d/1 active (MUTEX VIOLATION!)", converting)
+    }
 
     // Check disk space (simplified - would need syscall for real implementation)
     diskStatus := "✅ Sufficient"
@@ -890,16 +1174,20 @@ func (tr *TelegramReceiver) handleHealthCommand(msg *tgbotapi.Message) {
 
 *Components*:
 • Database: %s
-• Download Workers: %s
-• Batch Workers: %s
 • Disk Space: %s
+
+*Workers*:
+• Download: %s
+• Extract: %s
+• Convert: %s
+• Store: %s
 
 *Queues*:
 • Download Queue: ✅ Operating
 • Batch Queue: ✅ Operating
 
 All systems operational.`,
-        dbStatus, downloadStatus, batchStatus, diskStatus)
+        dbStatus, diskStatus, downloadStatus, extractStatus, convertStatus, storeStatus)
 
     tr.sendReply(msg.ChatID, text)
 }
@@ -1150,12 +1438,16 @@ func TestLoad100Files(t *testing.T) {
 
     duration := time.Since(startTime)
 
-    // Verify duration < 2 hours
-    if duration > 2*time.Hour {
-        t.Errorf("Processing took %v, expected < 2 hours", duration)
+    // Verify duration < 2.5 hours (corrected target: 2.2 hours with some buffer)
+    if duration > 150*time.Minute {
+        t.Errorf("Processing took %v, expected < 2.5 hours (target: 2.2 hours)", duration)
     }
 
-    t.Logf("Processed 100 files in %v", duration)
+    // Log actual vs target
+    t.Logf("Processed 100 files in %v (target: 2.2 hours, speedup: 1.95×)", duration)
+
+    // Verify mutex constraints were maintained
+    verifyMutexConstraints(t)
 }
 
 func TestLoad1000Files(t *testing.T) {
@@ -1213,16 +1505,19 @@ go tool pprof mem.prof
 
 ### Phase 6 Completion Checklist
 
-- ✅ Unit tests written for config, batch coordinator, workers
+- ✅ Unit tests written for config, stage workers, batch coordinator
 - ✅ Integration tests cover end-to-end pipeline
-- ✅ Load test with 100 files completes in < 2 hours
-- ✅ Load test with 1000 files maintains throughput
+- ✅ Load test with 100 files completes in < 2.5 hours (target: 2.2 hours, 1.95× speedup)
+- ✅ Load test with 1000 files maintains throughput (~45 files/hour)
+- ✅ Mutex constraint tests verify only 1 extract/convert at a time
+- ✅ Batch isolation tests verify 5 concurrent store workers safe
 - ✅ Performance profiling completed
 - ✅ Bottlenecks identified and optimized
 - ✅ RAM usage < 20% during load test
 - ✅ CPU usage < 50% sustained
 - ✅ Success rate > 98% over 1000-file test
 - ✅ Zero data loss verified in crash recovery tests
+- ✅ Config validation enforces worker count constraints
 
 ---
 
@@ -1246,14 +1541,28 @@ Add section to existing CLAUDE.md:
 ## Option 2: Batch-Based Parallel Processing (Alternative Architecture)
 
 **Status**: Production-ready alternative for high-throughput scenarios
+**Version**: 2.0 (Corrected Architecture)
 
 ### Architecture Overview
 
-Option 2 implements batch-based parallel processing for 6× faster throughput:
+Option 2 implements batch-based parallel processing for 1.95× faster throughput:
 - **Download**: 3 concurrent workers (unchanged)
 - **Batch Formation**: Groups files into batches of 10
-- **Batch Processing**: 5 concurrent batch workers
+- **Extract Stage**: 1 worker with global mutex (CANNOT run concurrently)
+- **Convert Stage**: 1 worker with global mutex (CANNOT run concurrently)
+- **Store Stage**: 5 concurrent workers (safe due to batch directory isolation)
 - **Code Preservation**: 100% - extract.go, convert.go, store.go unchanged
+
+### Critical Constraints
+
+**IMPORTANT**: Extract and convert stages CANNOT run simultaneously due to code limitations.
+
+Solution:
+- Global mutex enforcement for extract stage
+- Global mutex enforcement for convert stage
+- Sequential processing through extract → convert stages
+- Concurrent processing only in store stage (5 workers)
+- Batch directory isolation enables safe store concurrency
 
 ### Directory Structure
 
@@ -1266,34 +1575,64 @@ telegram-bot-option2/
 ├── batches/                 # Batch workspaces (auto-managed)
 │   └── batch_NNN/
 │       ├── app/extraction/files/  # Isolated per batch
+│       │   ├── all/         # Input archives
+│       │   ├── txt/         # Direct TXT files
+│       │   ├── pass/        # Extracted files
+│       │   └── nopass/      # Failed extractions
 │       └── logs/            # Batch-specific logs
 ├── coordinator/             # Orchestration service
 │   ├── main.go
-│   ├── batch_worker.go
+│   ├── stage_mutex.go       # Global mutexes
+│   ├── extract_worker.go    # 1 instance
+│   ├── convert_worker.go    # 1 instance
+│   ├── store_worker.go      # 5 instances
 │   └── ...
 └── downloads/               # Temporary download storage
 ```
 
 ### Performance Characteristics
 
-- **Throughput**: 50-60 files/hour sustained
-- **Processing Time**: 100 files in ~2 hours (vs 4.4 hours sequential)
-- **Concurrency**: 5 batches × 10 files = 50 files processing simultaneously
+- **Throughput**: 40-45 files/hour sustained
+- **Processing Time**: 100 files in ~2.2 hours (vs 4.4 hours sequential)
+- **Speedup**: 1.95× faster
+- **Concurrency**: Stage-level (1 extract + 1 convert + 5 store max)
 - **Resource Usage**: < 20% RAM, < 50% CPU
+
+### Worker Architecture
+
+```
+QUEUED Batches
+    ↓
+Extract Worker (1, mutex-locked)
+    ↓ Status: PENDING_CONVERT
+Convert Worker (1, mutex-locked)
+    ↓ Status: PENDING_STORE
+Store Workers (5, concurrent-safe)
+    ↓
+COMPLETED
+```
+
+**Pipeline Overlap Example**:
+- Batch 001: STORING (using 1 of 5 store workers)
+- Batch 002: CONVERTING (using the convert worker)
+- Batch 003: EXTRACTING (using the extract worker)
+- Batches 004-010: QUEUED (waiting for stages)
 
 ### When to Use Option 2
 
 Choose Option 2 when:
 - Processing > 100 files regularly
-- Throughput is priority over simplicity
-- Team can manage additional complexity
-- Infrastructure supports 5 concurrent batch workers
+- Throughput improvement (1.95×) justifies added complexity
+- Team can manage stage-specific worker architecture
+- Infrastructure supports concurrent operations
+- Willing to accept mutex constraints
 
 Choose Option 1 when:
 - Processing < 50 files at a time
 - Simplicity and reliability are priorities
 - Limited infrastructure resources
 - Easier debugging is preferred
+- Sequential processing is acceptable
 ```
 
 ---
