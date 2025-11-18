@@ -1,0 +1,78 @@
+groups:
+  - name: telegram_bot_alerts
+    rules:
+      - alert: HighQueueSize
+        expr: telegram_bot_queue_size{status="pending"} > 100
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High queue size: {{ $value }} files pending"
+          description: "Download queue has more than 100 pending files for 15 minutes"
+
+      - alert: LowSuccessRate
+        expr: |
+          (rate(telegram_bot_batches_completed_total[1h]) /
+           (rate(telegram_bot_batches_completed_total[1h]) + rate(telegram_bot_batches_failed_total[1h]))) < 0.95
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Batch success rate below 95%"
+          description: "Batch processing success rate has been below 95% for 30 minutes"
+
+      - alert: ExtractMutexViolation
+        expr: telegram_bot_extract_worker_active > 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Extract mutex violation detected"
+          description: "More than 1 extract operation running simultaneously - ARCHITECTURAL CONSTRAINT VIOLATED"
+
+      - alert: ConvertMutexViolation
+        expr: telegram_bot_convert_worker_active > 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Convert mutex violation detected"
+          description: "More than 1 convert operation running simultaneously - ARCHITECTURAL CONSTRAINT VIOLATED"
+
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes / 1024 / 1024 > 3072
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage: {{ $value | humanize }}MB"
+          description: "Coordinator memory usage exceeds 3GB for 10 minutes"
+
+      - alert: DatabaseConnectionFailure
+        expr: up{job="telegram-bot-coordinator"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Coordinator is down"
+          description: "Telegram bot coordinator has been unreachable for 2 minutes"
+
+      - alert: BatchProcessingStalled
+        expr: increase(telegram_bot_batches_completed_total[1h]) == 0 and telegram_bot_queue_size{status="queued"} > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Batch processing appears stalled"
+          description: "No batches completed in the last hour despite having queued batches"
+
+      - alert: HighDownloadFailureRate
+        expr: |
+          rate(telegram_bot_downloads_failed_total[30m]) /
+          (rate(telegram_bot_downloads_completed_total[30m]) + rate(telegram_bot_downloads_failed_total[30m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High download failure rate: {{ $value | humanizePercentage }}"
+          description: "More than 10% of downloads are failing"
