@@ -11,6 +11,7 @@ import (
 
 	_ "github.com/lib/pq"
 	"github.com/redlabs-sc/telegram-data-processor-bot-v3/config"
+	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/batch"
 	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/download"
 	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/health"
 	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/logger"
@@ -101,11 +102,22 @@ func main() {
 		log.Info("Download worker started", zap.String("worker_id", workerID))
 	}
 
-	// 9. TODO: Start batch coordinator (Phase 3)
+	// 9. Start batch coordinator
+	batchCoordinator := batch.NewCoordinator(cfg, db, log)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		batchCoordinator.Start(ctx)
+	}()
+	log.Info("Batch coordinator started",
+		zap.Int("batch_size", cfg.BatchSize),
+		zap.Int("batch_timeout_sec", cfg.BatchTimeoutSec))
+
 	// 10. TODO: Start stage workers - extract, convert, store (Phase 4)
 
-	log.Info("Phase 2 download pipeline completed successfully",
+	log.Info("Phase 3 batch coordinator completed successfully",
 		zap.Int("download_workers", cfg.MaxDownloadWorkers),
+		zap.Int("batch_size", cfg.BatchSize),
 		zap.Int("max_extract_workers", cfg.MaxExtractWorkers),
 		zap.Int("max_convert_workers", cfg.MaxConvertWorkers),
 		zap.Int("max_store_workers", cfg.MaxStoreWorkers))
