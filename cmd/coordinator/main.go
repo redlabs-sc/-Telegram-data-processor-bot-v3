@@ -1,17 +1,21 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	_ "github.com/lib/pq"
 	"github.com/redlabs-sc/telegram-data-processor-bot-v3/config"
+	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/download"
 	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/health"
 	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/logger"
 	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/metrics"
+	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/telegram"
 	"go.uber.org/zap"
 )
 
@@ -62,12 +66,46 @@ func main() {
 	metrics.StartMetricsServer(cfg, db, log)
 	log.Info("Metrics server started", zap.Int("port", cfg.MetricsPort))
 
-	// 6. TODO: Initialize Telegram bot receiver (Phase 2)
-	// 7. TODO: Start download workers (Phase 2)
-	// 8. TODO: Start batch coordinator (Phase 3)
-	// 9. TODO: Start stage workers - extract, convert, store (Phase 4)
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	log.Info("Phase 1 foundation completed successfully",
+	// 6. Crash recovery for downloads
+	if err := download.RecoverCrashedDownloads(ctx, db, log); err != nil {
+		log.Error("Error during crash recovery", zap.Error(err))
+	}
+
+	// 7. Initialize Telegram bot receiver
+	receiver, err := telegram.NewReceiver(cfg, db, log)
+	if err != nil {
+		log.Fatal("Error creating Telegram receiver", zap.Error(err))
+	}
+	log.Info("Telegram receiver initialized")
+
+	// Start receiver in background
+	go receiver.Start()
+	log.Info("Telegram receiver started")
+
+	// 8. Start download workers (3 concurrent)
+	var wg sync.WaitGroup
+	for i := 1; i <= cfg.MaxDownloadWorkers; i++ {
+		workerID := fmt.Sprintf("download_worker_%d", i)
+		worker := download.NewWorker(workerID, receiver.GetBot(), cfg, db, log)
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker.Start(ctx)
+		}()
+
+		log.Info("Download worker started", zap.String("worker_id", workerID))
+	}
+
+	// 9. TODO: Start batch coordinator (Phase 3)
+	// 10. TODO: Start stage workers - extract, convert, store (Phase 4)
+
+	log.Info("Phase 2 download pipeline completed successfully",
+		zap.Int("download_workers", cfg.MaxDownloadWorkers),
 		zap.Int("max_extract_workers", cfg.MaxExtractWorkers),
 		zap.Int("max_convert_workers", cfg.MaxConvertWorkers),
 		zap.Int("max_store_workers", cfg.MaxStoreWorkers))
@@ -80,7 +118,23 @@ func main() {
 	sig := <-sigChan
 	log.Info("Received shutdown signal", zap.String("signal", sig.String()))
 
-	// TODO: Graceful shutdown logic
+	// Graceful shutdown
 	log.Info("Shutting down gracefully...")
+	cancel() // Stop all workers
+
+	// Wait for workers to finish (with timeout)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Info("All workers stopped gracefully")
+	case <-sigChan:
+		log.Warn("Forced shutdown - workers may not have stopped cleanly")
+	}
+
 	log.Info("Shutdown complete")
 }
