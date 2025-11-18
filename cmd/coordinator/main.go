@@ -17,6 +17,7 @@ import (
 	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/logger"
 	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/metrics"
 	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/telegram"
+	"github.com/redlabs-sc/telegram-data-processor-bot-v3/internal/workers"
 	"go.uber.org/zap"
 )
 
@@ -113,14 +114,60 @@ func main() {
 		zap.Int("batch_size", cfg.BatchSize),
 		zap.Int("batch_timeout_sec", cfg.BatchTimeoutSec))
 
-	// 10. TODO: Start stage workers - extract, convert, store (Phase 4)
+	// 10. Start EXTRACT workers (exactly 1, with global mutex)
+	for i := 1; i <= cfg.MaxExtractWorkers; i++ {
+		workerID := fmt.Sprintf("extract_worker_%d", i)
+		worker := workers.NewExtractWorker(workerID, cfg, db, log)
 
-	log.Info("Phase 3 batch coordinator completed successfully",
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker.Start(ctx)
+		}()
+
+		log.Info("Extract worker started",
+			zap.String("worker_id", workerID),
+			zap.String("note", "mutex enforced - only 1 batch extracts at a time"))
+	}
+
+	// 11. Start CONVERT workers (exactly 1, with global mutex)
+	for i := 1; i <= cfg.MaxConvertWorkers; i++ {
+		workerID := fmt.Sprintf("convert_worker_%d", i)
+		worker := workers.NewConvertWorker(workerID, cfg, db, log)
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker.Start(ctx)
+		}()
+
+		log.Info("Convert worker started",
+			zap.String("worker_id", workerID),
+			zap.String("note", "mutex enforced - only 1 batch converts at a time"))
+	}
+
+	// 12. Start STORE workers (5 concurrent, batch isolation ensures safety)
+	for i := 1; i <= cfg.MaxStoreWorkers; i++ {
+		workerID := fmt.Sprintf("store_worker_%d", i)
+		worker := workers.NewStoreWorker(workerID, cfg, db, log)
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker.Start(ctx)
+		}()
+
+		log.Info("Store worker started",
+			zap.String("worker_id", workerID),
+			zap.String("note", "concurrent safe - batch directory isolation"))
+	}
+
+	log.Info("Phase 4 stage workers completed successfully",
 		zap.Int("download_workers", cfg.MaxDownloadWorkers),
 		zap.Int("batch_size", cfg.BatchSize),
-		zap.Int("max_extract_workers", cfg.MaxExtractWorkers),
-		zap.Int("max_convert_workers", cfg.MaxConvertWorkers),
-		zap.Int("max_store_workers", cfg.MaxStoreWorkers))
+		zap.Int("extract_workers", cfg.MaxExtractWorkers),
+		zap.Int("convert_workers", cfg.MaxConvertWorkers),
+		zap.Int("store_workers", cfg.MaxStoreWorkers))
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
