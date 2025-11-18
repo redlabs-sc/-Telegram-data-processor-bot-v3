@@ -169,6 +169,17 @@ func main() {
 		zap.Int("convert_workers", cfg.MaxConvertWorkers),
 		zap.Int("store_workers", cfg.MaxStoreWorkers))
 
+	// 13. Start batch cleanup service
+	batchCleanup := batch.NewCleanup(cfg, db, log)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		batchCleanup.Start(ctx)
+	}()
+	log.Info("Batch cleanup service started",
+		zap.Int("completed_retention_hours", cfg.CompletedBatchRetentionHours),
+		zap.Int("failed_retention_days", cfg.FailedBatchRetentionDays))
+
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
