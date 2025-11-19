@@ -272,9 +272,22 @@ install_postgresql() {
 setup_database() {
     log_step "Setting up PostgreSQL database"
 
-    DB_NAME="telegram_bot_option2"
-    DB_USER="bot_user"
-    DB_PASSWORD="change_me_in_production"
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    # Read from .env file if it exists, otherwise use defaults
+    if [ -f "$SCRIPT_DIR/.env" ]; then
+        DB_NAME=$(grep -E "^DB_NAME=" "$SCRIPT_DIR/.env" | cut -d'=' -f2 | tr -d '"' | tr -d "'" | xargs)
+        DB_USER=$(grep -E "^DB_USER=" "$SCRIPT_DIR/.env" | cut -d'=' -f2 | tr -d '"' | tr -d "'" | xargs)
+        DB_PASSWORD=$(grep -E "^DB_PASSWORD=" "$SCRIPT_DIR/.env" | cut -d'=' -f2 | tr -d '"' | tr -d "'" | xargs)
+        log_info "Using database config from .env file"
+    fi
+
+    # Use defaults if not set
+    DB_NAME="${DB_NAME:-telegram_bot_option2}"
+    DB_USER="${DB_USER:-bot_user}"
+    DB_PASSWORD="${DB_PASSWORD:-change_me_in_production}"
+
+    log_info "Database: $DB_NAME, User: $DB_USER"
 
     # Check if user exists
     if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" | grep -q 1; then
@@ -321,9 +334,17 @@ run_migrations() {
         return 0
     fi
 
-    DB_NAME="telegram_bot_option2"
-    DB_USER="bot_user"
-    DB_PASSWORD="change_me_in_production"
+    # Read from .env file if it exists, otherwise use defaults
+    if [ -f "$SCRIPT_DIR/.env" ]; then
+        DB_NAME=$(grep -E "^DB_NAME=" "$SCRIPT_DIR/.env" | cut -d'=' -f2 | tr -d '"' | tr -d "'" | xargs)
+        DB_USER=$(grep -E "^DB_USER=" "$SCRIPT_DIR/.env" | cut -d'=' -f2 | tr -d '"' | tr -d "'" | xargs)
+        DB_PASSWORD=$(grep -E "^DB_PASSWORD=" "$SCRIPT_DIR/.env" | cut -d'=' -f2 | tr -d '"' | tr -d "'" | xargs)
+    fi
+
+    # Use defaults if not set
+    DB_NAME="${DB_NAME:-telegram_bot_option2}"
+    DB_USER="${DB_USER:-bot_user}"
+    DB_PASSWORD="${DB_PASSWORD:-change_me_in_production}"
 
     # Run each migration file
     for migration in "$MIGRATION_DIR"/*.sql; do
@@ -561,8 +582,12 @@ verify_installation() {
     fi
 
     # Check database
-    DB_NAME="telegram_bot_option2"
-    DB_USER="bot_user"
+    # Read from .env file if it exists
+    if [ -f "$SCRIPT_DIR/.env" ]; then
+        DB_NAME=$(grep -E "^DB_NAME=" "$SCRIPT_DIR/.env" | cut -d'=' -f2 | tr -d '"' | tr -d "'" | xargs)
+    fi
+    DB_NAME="${DB_NAME:-telegram_bot_option2}"
+
     if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
         log_success "✓ Database '$DB_NAME' exists"
     else
