@@ -66,7 +66,7 @@ func (r *Receiver) Start() {
 func (r *Receiver) handleMessage(msg *tgbotapi.Message) {
 	// Check if user is admin
 	if !r.cfg.IsAdmin(msg.From.ID) {
-		r.sendReply(msg.ChatID, "❌ Unauthorized. This bot is admin-only.")
+		r.sendReply(msg.Chat.ID, "❌ Unauthorized. This bot is admin-only.")
 		r.logger.Warn("Unauthorized access attempt",
 			zap.Int64("user_id", msg.From.ID),
 			zap.String("username", msg.From.UserName))
@@ -103,7 +103,7 @@ func (r *Receiver) handleCommand(msg *tgbotapi.Message) {
 	case "health":
 		r.handleHealthCommand(msg)
 	default:
-		r.sendReply(msg.ChatID, "Unknown command. Send /help for available commands.")
+		r.sendReply(msg.Chat.ID, "Unknown command. Send /help for available commands.")
 	}
 }
 
@@ -126,7 +126,7 @@ This bot processes archive files (ZIP, RAR) and text files with high-speed batch
 🚀 Files are processed in batches of 10 for maximum speed!
 ⚙️ Architecture: 1 extract + 1 convert + 5 store workers (corrected)`
 
-	r.sendReply(msg.ChatID, text)
+	r.sendReply(msg.Chat.ID, text)
 }
 
 func (r *Receiver) handleHelp(msg *tgbotapi.Message) {
@@ -153,7 +153,7 @@ Simply send a file (ZIP, RAR, or TXT) and it will be queued for processing.
 🔒 Constraint: Extract and convert stages run sequentially (cannot run simultaneously).
 ✅ Store stage is safe for concurrent execution due to batch directory isolation.`
 
-	r.sendReply(msg.ChatID, text)
+	r.sendReply(msg.Chat.ID, text)
 }
 
 func (r *Receiver) handleQueue(msg *tgbotapi.Message) {
@@ -196,7 +196,7 @@ func (r *Receiver) handleQueue(msg *tgbotapi.Message) {
 %s`,
 		pending, downloading, downloaded, failed, nextBatchInfo)
 
-	r.sendReply(msg.ChatID, text)
+	r.sendReply(msg.Chat.ID, text)
 }
 
 func (r *Receiver) handleBatches(msg *tgbotapi.Message) {
@@ -210,7 +210,7 @@ func (r *Receiver) handleBatches(msg *tgbotapi.Message) {
 	`)
 
 	if err != nil {
-		r.sendReply(msg.ChatID, "Error querying batches")
+		r.sendReply(msg.Chat.ID, "Error querying batches")
 		return
 	}
 	defer rows.Close()
@@ -248,7 +248,7 @@ func (r *Receiver) handleBatches(msg *tgbotapi.Message) {
 	`)
 
 	if err != nil {
-		r.sendReply(msg.ChatID, "Error querying completed batches")
+		r.sendReply(msg.Chat.ID, "Error querying completed batches")
 		return
 	}
 	defer rows.Close()
@@ -284,7 +284,7 @@ func (r *Receiver) handleBatches(msg *tgbotapi.Message) {
 *Recently Completed* (Last Hour):
 %s`, activeText, completedText)
 
-	r.sendReply(msg.ChatID, text)
+	r.sendReply(msg.Chat.ID, text)
 }
 
 func (r *Receiver) handleStats(msg *tgbotapi.Message) {
@@ -367,7 +367,7 @@ func (r *Receiver) handleStats(msg *tgbotapi.Message) {
 		storeWorkers, r.cfg.MaxStoreWorkers,
 		queueSize)
 
-	r.sendReply(msg.ChatID, text)
+	r.sendReply(msg.Chat.ID, text)
 }
 
 func (r *Receiver) handleHealthCommand(msg *tgbotapi.Message) {
@@ -422,7 +422,7 @@ func (r *Receiver) handleHealthCommand(msg *tgbotapi.Message) {
 All systems operational.`,
 		dbStatus, diskStatus, downloadStatus, extractStatus, convertStatus, storeStatus)
 
-	r.sendReply(msg.ChatID, text)
+	r.sendReply(msg.Chat.ID, text)
 }
 
 func (r *Receiver) handleDocument(msg *tgbotapi.Message) {
@@ -431,14 +431,14 @@ func (r *Receiver) handleDocument(msg *tgbotapi.Message) {
 	// Validate file size
 	maxSizeBytes := r.cfg.MaxFileSizeMB * 1024 * 1024
 	if int64(doc.FileSize) > maxSizeBytes {
-		r.sendReply(msg.ChatID, fmt.Sprintf("❌ File too large. Max size: %d MB", r.cfg.MaxFileSizeMB))
+		r.sendReply(msg.Chat.ID, fmt.Sprintf("❌ File too large. Max size: %d MB", r.cfg.MaxFileSizeMB))
 		return
 	}
 
 	// Validate file type
 	fileType := getFileType(doc.FileName)
 	if fileType == "" {
-		r.sendReply(msg.ChatID, "❌ Unsupported file type. Supported: ZIP, RAR, TXT")
+		r.sendReply(msg.Chat.ID, "❌ Unsupported file type. Supported: ZIP, RAR, TXT")
 		return
 	}
 
@@ -448,12 +448,12 @@ func (r *Receiver) handleDocument(msg *tgbotapi.Message) {
 		r.logger.Error("Error enqueueing download",
 			zap.Error(err),
 			zap.String("filename", doc.FileName))
-		r.sendReply(msg.ChatID, "❌ Error queuing file for processing. Please try again.")
+		r.sendReply(msg.Chat.ID, "❌ Error queuing file for processing. Please try again.")
 		return
 	}
 
 	// Send confirmation
-	r.sendReply(msg.ChatID, fmt.Sprintf(`✅ File queued for processing
+	r.sendReply(msg.Chat.ID, fmt.Sprintf(`✅ File queued for processing
 
 📄 Filename: %s
 📦 Size: %.2f MB

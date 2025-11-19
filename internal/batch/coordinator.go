@@ -12,6 +12,15 @@ import (
 	"go.uber.org/zap"
 )
 
+// fileInfo holds information about a downloaded file for batch processing
+type fileInfo struct {
+	TaskID    int64
+	Filename  string
+	FileType  string
+	FileSize  int64
+	CreatedAt time.Time
+}
+
 type Coordinator struct {
 	cfg    *config.Config
 	db     *sql.DB
@@ -84,14 +93,6 @@ func (bc *Coordinator) tryCreateBatch(ctx context.Context) {
 		return
 	}
 	defer rows.Close()
-
-	type fileInfo struct {
-		TaskID    int64
-		Filename  string
-		FileType  string
-		FileSize  int64
-		CreatedAt time.Time
-	}
 
 	var files []fileInfo
 	var oldestFileTime time.Time
