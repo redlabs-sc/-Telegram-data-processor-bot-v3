@@ -145,8 +145,17 @@ func (cw *ConvertWorker) runConvertStage(ctx context.Context, batchID string) er
 	defer cancel()
 
 	// Execute convert.go as subprocess
-	// Convert.go reads from app/extraction/files/pass/ and outputs to app/extraction/files/all_extracted.txt
+	// Convert.go reads from app/extraction/files/pass/ and outputs to app/extraction/files/txt/
 	cmd := exec.CommandContext(convertCtx, "go", "run", convertPath)
+
+	// Set environment variables for convert.go
+	// Generate unique output filename with batch ID and timestamp
+	outputFileName := fmt.Sprintf("output_%s_%s.txt", batchID, time.Now().Format("20060102_150405"))
+	cmd.Env = append(os.Environ(),
+		"CONVERT_INPUT_DIR=app/extraction/files/pass",
+		fmt.Sprintf("CONVERT_OUTPUT_FILE=app/extraction/files/txt/%s", outputFileName),
+	)
+
 	output, err := cmd.CombinedOutput()
 
 	// Log output to batch-specific log file

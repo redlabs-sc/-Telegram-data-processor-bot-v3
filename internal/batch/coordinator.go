@@ -239,13 +239,16 @@ func (bc *Coordinator) createBatchDirectories(batchID string) error {
 
 	// Create batch directory structure matching extract.go/convert.go/store.go expectations
 	dirs := []string{
-		filepath.Join(batchRoot, "app", "extraction", "files", "all"),    // Input for extract (archives)
-		filepath.Join(batchRoot, "app", "extraction", "files", "pass"),   // Output from extract, input for convert
-		filepath.Join(batchRoot, "app", "extraction", "files", "txt"),    // Output from convert, input for store (also direct TXT uploads)
-		filepath.Join(batchRoot, "app", "extraction", "files", "nopass"), // Failed extractions (no password)
-		filepath.Join(batchRoot, "app", "extraction", "files", "error"),  // Errors
-		filepath.Join(batchRoot, "app", "extraction", "files", "done"),   // Convert done files
-		filepath.Join(batchRoot, "app", "extraction", "files", "etbanks"), // Convert etbanks
+		filepath.Join(batchRoot, "app", "extraction", "files", "all"),           // Input for extract (archives)
+		filepath.Join(batchRoot, "app", "extraction", "files", "pass"),          // Output from extract, input for convert
+		filepath.Join(batchRoot, "app", "extraction", "files", "txt"),           // Output from convert, input for store (also direct TXT uploads)
+		filepath.Join(batchRoot, "app", "extraction", "files", "nopass"),        // Failed extractions (no password)
+		filepath.Join(batchRoot, "app", "extraction", "files", "error"),         // Errors
+		filepath.Join(batchRoot, "app", "extraction", "files", "done"),          // Convert done files
+		filepath.Join(batchRoot, "app", "extraction", "files", "etbanks"),       // Convert etbanks
+		filepath.Join(batchRoot, "app", "extraction", "files", "nonsorted"),     // Store stage working directory
+		filepath.Join(batchRoot, "app", "extraction", "files", "Sorted_toshare"), // Store stage output
+		filepath.Join(batchRoot, "app", "extraction", "files", "bettings"),      // Store stage betting files
 		filepath.Join(batchRoot, "logs"), // Batch-specific logs
 	}
 
