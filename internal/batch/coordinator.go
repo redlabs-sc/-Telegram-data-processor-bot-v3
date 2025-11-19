@@ -210,11 +210,11 @@ func (bc *Coordinator) createBatch(ctx context.Context, batchID string, files []
 
 		var destPath string
 		if f.FileType == "TXT" {
-			// TXT files go directly to pass directory (already text)
-			destPath = filepath.Join("batches", batchID, "app", "extraction", "files", "pass", f.Filename)
+			// TXT files go directly to txt directory (skip extract/convert, go to store input)
+			destPath = filepath.Join("batches", batchID, "app", "extraction", "files", "txt", f.Filename)
 		} else {
 			// Archives go to all directory for extraction
-			destPath = filepath.Join("batches", batchID, "downloads", f.Filename)
+			destPath = filepath.Join("batches", batchID, "app", "extraction", "files", "all", f.Filename)
 		}
 
 		if err := os.Rename(sourcePath, destPath); err != nil {
@@ -237,12 +237,15 @@ func (bc *Coordinator) createBatch(ctx context.Context, batchID string, files []
 func (bc *Coordinator) createBatchDirectories(batchID string) error {
 	batchRoot := filepath.Join("batches", batchID)
 
-	// Create batch directory structure matching extract.go expectations
+	// Create batch directory structure matching extract.go/convert.go/store.go expectations
 	dirs := []string{
-		filepath.Join(batchRoot, "downloads"),                           // Input: archive files
-		filepath.Join(batchRoot, "app", "extraction", "files", "pass"),  // Output: extracted text files
-		filepath.Join(batchRoot, "app", "extraction", "files", "nopass"), // Failed extractions
-		filepath.Join(batchRoot, "app", "extraction", "files", "error"), // Errors
+		filepath.Join(batchRoot, "app", "extraction", "files", "all"),    // Input for extract (archives)
+		filepath.Join(batchRoot, "app", "extraction", "files", "pass"),   // Output from extract, input for convert
+		filepath.Join(batchRoot, "app", "extraction", "files", "txt"),    // Output from convert, input for store (also direct TXT uploads)
+		filepath.Join(batchRoot, "app", "extraction", "files", "nopass"), // Failed extractions (no password)
+		filepath.Join(batchRoot, "app", "extraction", "files", "error"),  // Errors
+		filepath.Join(batchRoot, "app", "extraction", "files", "done"),   // Convert done files
+		filepath.Join(batchRoot, "app", "extraction", "files", "etbanks"), // Convert etbanks
 		filepath.Join(batchRoot, "logs"), // Batch-specific logs
 	}
 
@@ -252,9 +255,9 @@ func (bc *Coordinator) createBatchDirectories(batchID string) error {
 		}
 	}
 
-	// Copy pass.txt to batch directory (if exists)
+	// Copy pass.txt to batch ROOT directory (extract.go uses ./pass.txt relative path)
 	passFile := filepath.Join("app", "extraction", "pass.txt")
-	batchPassFile := filepath.Join(batchRoot, "app", "extraction", "pass.txt")
+	batchPassFile := filepath.Join(batchRoot, "pass.txt")
 
 	if _, err := os.Stat(passFile); err == nil {
 		// Read source
@@ -262,9 +265,9 @@ func (bc *Coordinator) createBatchDirectories(batchID string) error {
 		if err != nil {
 			bc.logger.Warn("Error reading pass.txt", zap.Error(err))
 		} else {
-			// Write to batch
+			// Write to batch root
 			if err := os.WriteFile(batchPassFile, data, 0644); err != nil {
-				bc.logger.Warn("Error copying pass.txt to batch", zap.Error(err))
+				bc.logger.Warn("Error copying pass.txt to batch root", zap.Error(err))
 			}
 		}
 	}
