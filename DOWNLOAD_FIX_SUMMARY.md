@@ -16,15 +16,69 @@ Based on the database query results and error logs, the download failures were c
 
 ## Root Cause
 
-The `bot.GetFile()` call in `worker.go:149` was failing for large files because:
+**UPDATE**: After implementing enhanced logging, the actual root cause was identified:
 
+### Primary Issue: Incorrect Download URL Construction
+
+The local Bot API's `GetFile()` call returns an **absolute filesystem path**:
+```
+/var/lib/telegram-bot-api/8383132189:AAGzX3APQYJmO1LMC6EOZHzf0LyZUWyL0h8/documents/file_7.rar
+```
+
+But the download URL was being constructed with this full path, resulting in:
+```
+http://localhost:8081/file/bot.../​/var/lib/telegram-bot-api/.../documents/file_7.rar
+```
+
+This caused **404 errors** because the URL is malformed (double slash, full path instead of relative).
+
+### Secondary Issues (Also Fixed):
 1. **No retry logic**: Single API call failure caused immediate task failure
-2. **Local Bot API timeout**: The local Bot API server wasn't responding properly for large files
-3. **Insufficient error logging**: Couldn't diagnose the exact failure point
+2. **Insufficient error logging**: Couldn't diagnose the exact failure point
 
 ## Fixes Implemented
 
-### 1. Added Retry Logic with Exponential Backoff
+### 1. Fixed Download URL Construction for Local Bot API
+
+**Problem**: Local Bot API returns absolute filesystem paths, not relative paths needed for download URLs.
+
+**Solution**: Extract relative path from absolute path before constructing URL.
+
+```go
+if w.cfg.UseLocalBotAPI {
+    // file.FilePath = "/var/lib/telegram-bot-api/BOT_TOKEN/documents/file.rar"
+    // We need: "documents/file.rar"
+
+    relativePath := file.FilePath
+    if strings.HasPrefix(file.FilePath, "/") {
+        parts := strings.Split(file.FilePath, "/")
+
+        // Find bot token directory and take everything after it
+        for i, part := range parts {
+            if strings.Contains(part, ":") && strings.Contains(part, w.cfg.TelegramBotToken[:10]) {
+                if i+1 < len(parts) {
+                    relativePath = strings.Join(parts[i+1:], "/")
+                    break
+                }
+            }
+        }
+
+        // Fallback: use last 2 parts if token not found
+        if !foundToken && len(parts) >= 2 {
+            relativePath = strings.Join(parts[len(parts)-2:], "/")
+        }
+    }
+
+    fileURL = fmt.Sprintf("%s/file/bot%s/%s",
+        w.cfg.LocalBotAPIURL, w.cfg.TelegramBotToken, relativePath)
+}
+```
+
+**Result**:
+- ❌ Before: `http://localhost:8081/file/bot.../​/var/lib/telegram-bot-api/.../documents/file_7.rar`
+- ✅ After: `http://localhost:8081/file/bot.../documents/file_7.rar`
+
+### 2. Added Retry Logic with Exponential Backoff
 
 ```go
 maxRetries := 3
@@ -102,7 +156,16 @@ for attempt := 1; attempt <= maxRetries; attempt++ {
 }
 ```
 
-### 3. Download Progress Tracking
+### 3. Enhanced Error Logging
+
+**Added logging for every step:**
+- GetFile API call attempts, failures, and successes
+- Absolute to relative path extraction process
+- Constructed download URLs before HTTP request
+- HTTP response codes with full URLs on failures
+- Download progress (bytes written, duration, speed)
+
+### 4. Download Progress Tracking
 
 - Tracks bytes written during `io.Copy()`
 - Calculates download duration and speed
@@ -172,9 +235,14 @@ tail -f logs/coordinator.log | grep "task_id\":6"
 ## Files Modified
 
 - `internal/download/worker.go`:
-  - Added retry logic for `GetFile` (lines 147-177)
-  - Enhanced error logging for HTTP download (lines 224-235)
+  - **CRITICAL FIX**: Added URL path extraction for local Bot API (lines 186-231)
+    - Extracts relative path from absolute filesystem path
+    - Prevents malformed URLs with double slashes
+    - Fixes 404 errors caused by incorrect URL construction
+  - Added retry logic for `GetFile` API calls (lines 151-177)
+  - Enhanced error logging throughout download process
   - Added download progress tracking (lines 241-260)
+  - Added `strings` import for path manipulation
 
 ## Success Criteria
 

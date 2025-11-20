@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -183,7 +184,44 @@ func (w *Worker) downloadFile(ctx context.Context, taskID int64, fileID, filenam
 	// Determine download URL
 	var fileURL string
 	if w.cfg.UseLocalBotAPI {
-		fileURL = fmt.Sprintf("%s/file/bot%s/%s", w.cfg.LocalBotAPIURL, w.cfg.TelegramBotToken, file.FilePath)
+		// For local Bot API, file.FilePath returns absolute path like:
+		// /var/lib/telegram-bot-api/BOT_TOKEN/documents/file.rar
+		// We need to extract the relative path: documents/file.rar
+
+		relativePath := file.FilePath
+
+		// Check if it's an absolute path
+		if strings.HasPrefix(file.FilePath, "/") {
+			// Extract path after bot token directory
+			// Format: /var/lib/telegram-bot-api/{BOT_TOKEN}/documents/file.rar
+			parts := strings.Split(file.FilePath, "/")
+
+			// Find the index where bot token appears (or use last 2-3 parts as fallback)
+			foundToken := false
+			for i, part := range parts {
+				if strings.Contains(part, ":") && strings.Contains(part, w.cfg.TelegramBotToken[:10]) {
+					// Found bot token directory, take everything after it
+					if i+1 < len(parts) {
+						relativePath = strings.Join(parts[i+1:], "/")
+						foundToken = true
+						break
+					}
+				}
+			}
+
+			// Fallback: if we couldn't find token, use last meaningful parts
+			if !foundToken && len(parts) >= 2 {
+				// Take last 2 parts (e.g., documents/file.rar)
+				relativePath = strings.Join(parts[len(parts)-2:], "/")
+			}
+
+			w.logger.Info("Extracted relative path from absolute path",
+				zap.Int64("task_id", taskID),
+				zap.String("absolute_path", file.FilePath),
+				zap.String("relative_path", relativePath))
+		}
+
+		fileURL = fmt.Sprintf("%s/file/bot%s/%s", w.cfg.LocalBotAPIURL, w.cfg.TelegramBotToken, relativePath)
 	} else {
 		fileURL = file.Link(w.cfg.TelegramBotToken)
 	}
