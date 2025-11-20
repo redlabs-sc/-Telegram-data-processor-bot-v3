@@ -1,0 +1,96 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:14-alpine
+    container_name: telegram-bot-postgres
+    environment:
+      POSTGRES_DB: telegram_bot_option2
+      POSTGRES_USER: bot_user
+      POSTGRES_PASSWORD: change_me_in_production
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bot_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram-bot-coordinator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: telegram_bot_option2
+      DB_USER: bot_user
+      DB_PASSWORD: change_me_in_production
+      DB_SSL_MODE: disable
+    env_file:
+      - .env
+    volumes:
+      - ./batches:/app/batches
+      - ./downloads:/app/downloads
+      - ./logs:/app/logs
+      - ./app/extraction:/app/app/extraction:ro  # Read-only preserved code
+    ports:
+      - "8080:8080"  # Health check
+      - "9090:9090"  # Metrics
+    restart: unless-stopped
+
+  local-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+    ports:
+      - "8081:8081"
+    volumes:
+      - bot_api_data:/var/lib/telegram-bot-api
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: telegram-bot-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9091:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: telegram-bot-grafana
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/datasources:/etc/grafana/provisioning/datasources
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  bot_api_data:
+  prometheus_data:
+  grafana_data:
