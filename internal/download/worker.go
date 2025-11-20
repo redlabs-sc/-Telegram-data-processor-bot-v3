@@ -144,12 +144,41 @@ func (w *Worker) processNext(ctx context.Context) {
 }
 
 func (w *Worker) downloadFile(ctx context.Context, taskID int64, fileID, filename string) error {
-	// Get file from Telegram
-	fileConfig := tgbotapi.FileConfig{FileID: fileID}
-	file, err := w.bot.GetFile(fileConfig)
-	if err != nil {
-		return fmt.Errorf("get file error: %w", err)
+	// Get file from Telegram with retry logic
+	var file tgbotapi.File
+	var err error
+
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		fileConfig := tgbotapi.FileConfig{FileID: fileID}
+		file, err = w.bot.GetFile(fileConfig)
+
+		if err == nil {
+			break // Success
+		}
+
+		w.logger.Warn("GetFile attempt failed",
+			zap.Int("attempt", attempt),
+			zap.Int64("task_id", taskID),
+			zap.String("file_id", fileID),
+			zap.Error(err))
+
+		if attempt < maxRetries {
+			// Exponential backoff: 2s, 4s
+			backoff := time.Duration(1<<uint(attempt)) * time.Second
+			w.logger.Info("Retrying GetFile after backoff",
+				zap.Duration("backoff", backoff))
+			time.Sleep(backoff)
+		}
 	}
+
+	if err != nil {
+		return fmt.Errorf("get file error after %d attempts: %w", maxRetries, err)
+	}
+
+	w.logger.Info("GetFile succeeded",
+		zap.Int64("task_id", taskID),
+		zap.String("file_path", file.FilePath))
 
 	// Determine download URL
 	var fileURL string
@@ -158,6 +187,10 @@ func (w *Worker) downloadFile(ctx context.Context, taskID int64, fileID, filenam
 	} else {
 		fileURL = file.Link(w.cfg.TelegramBotToken)
 	}
+
+	w.logger.Info("Download URL constructed",
+		zap.Int64("task_id", taskID),
+		zap.String("url", fileURL))
 
 	// Download file to temporary location
 	tempPath := filepath.Join("downloads", fmt.Sprintf("%d_%s", taskID, filename))
@@ -188,17 +221,43 @@ func (w *Worker) downloadFile(ctx context.Context, taskID int64, fileID, filenam
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("http status: %d", resp.StatusCode)
+		w.logger.Error("HTTP download failed",
+			zap.Int64("task_id", taskID),
+			zap.String("url", fileURL),
+			zap.Int("status_code", resp.StatusCode),
+			zap.String("status", resp.Status))
+		return fmt.Errorf("http status: %d (%s) for URL: %s", resp.StatusCode, resp.Status, fileURL)
 	}
+
+	w.logger.Info("Download started",
+		zap.Int64("task_id", taskID),
+		zap.String("filename", filename),
+		zap.Int64("content_length", resp.ContentLength))
 
 	// Compute SHA256 while downloading
 	hash := sha256.New()
 	multiWriter := io.MultiWriter(out, hash)
 
-	_, err = io.Copy(multiWriter, resp.Body)
+	// Track download progress for large files
+	startTime := time.Now()
+	bytesWritten, err := io.Copy(multiWriter, resp.Body)
 	if err != nil {
+		w.logger.Error("Download copy failed",
+			zap.Int64("task_id", taskID),
+			zap.Int64("bytes_written", bytesWritten),
+			zap.Duration("elapsed", time.Since(startTime)),
+			zap.Error(err))
 		return fmt.Errorf("copy error: %w", err)
 	}
+
+	downloadDuration := time.Since(startTime)
+	downloadSpeedMBps := float64(bytesWritten) / downloadDuration.Seconds() / (1024 * 1024)
+
+	w.logger.Info("Download copy completed",
+		zap.Int64("task_id", taskID),
+		zap.Int64("bytes_written", bytesWritten),
+		zap.Duration("duration", downloadDuration),
+		zap.Float64("speed_mbps", downloadSpeedMBps))
 
 	// Store hash in database
 	sha256Hash := hex.EncodeToString(hash.Sum(nil))
