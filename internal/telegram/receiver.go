@@ -442,8 +442,32 @@ func (r *Receiver) handleDocument(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Insert into download queue
-	taskID, err := r.enqueueDownload(msg.From.ID, doc.FileID, doc.FileName, fileType, int64(doc.FileSize))
+	// CRITICAL FIX: Call GetFile immediately to capture file_path
+	// This solves:
+	// 1. Local Bot API async download delays
+	// 2. File ID expiration issues
+	// 3. Duplicate GetFile() calls
+	r.logger.Info("Calling GetFile to capture file information",
+		zap.String("file_id", doc.FileID),
+		zap.String("filename", doc.FileName))
+
+	fileConfig := tgbotapi.FileConfig{FileID: doc.FileID}
+	file, err := r.bot.GetFile(fileConfig)
+	if err != nil {
+		r.logger.Error("GetFile failed when receiving file",
+			zap.Error(err),
+			zap.String("file_id", doc.FileID),
+			zap.String("filename", doc.FileName))
+		r.sendReply(msg.Chat.ID, "❌ Error accessing file. Please try uploading again.")
+		return
+	}
+
+	r.logger.Info("GetFile succeeded, file_path captured",
+		zap.String("file_path", file.FilePath),
+		zap.String("filename", doc.FileName))
+
+	// Insert into download queue with file_path
+	taskID, err := r.enqueueDownload(msg.From.ID, doc.FileID, file.FilePath, doc.FileName, fileType, int64(doc.FileSize))
 	if err != nil {
 		r.logger.Error("Error enqueueing download",
 			zap.Error(err),
@@ -471,13 +495,13 @@ You'll receive a notification when processing completes.`,
 		zap.Int64("file_size", int64(doc.FileSize)))
 }
 
-func (r *Receiver) enqueueDownload(userID int64, fileID, filename, fileType string, fileSize int64) (int64, error) {
+func (r *Receiver) enqueueDownload(userID int64, fileID, filePath, filename, fileType string, fileSize int64) (int64, error) {
 	var taskID int64
 	err := r.db.QueryRow(`
-		INSERT INTO download_queue (file_id, user_id, filename, file_type, file_size, status)
-		VALUES ($1, $2, $3, $4, $5, 'PENDING')
+		INSERT INTO download_queue (file_id, file_path, user_id, filename, file_type, file_size, status)
+		VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')
 		RETURNING task_id
-	`, fileID, userID, filename, fileType, fileSize).Scan(&taskID)
+	`, fileID, filePath, userID, filename, fileType, fileSize).Scan(&taskID)
 
 	return taskID, err
 }

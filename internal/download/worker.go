@@ -65,19 +65,20 @@ func (w *Worker) processNext(ctx context.Context) {
 	var task struct {
 		TaskID   int64
 		FileID   string
+		FilePath string
 		Filename string
 		FileType string
 		FileSize int64
 	}
 
 	err = tx.QueryRowContext(ctx, `
-		SELECT task_id, file_id, filename, file_type, file_size
+		SELECT task_id, file_id, file_path, filename, file_type, file_size
 		FROM download_queue
 		WHERE status = 'PENDING'
 		ORDER BY priority DESC, created_at ASC
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`).Scan(&task.TaskID, &task.FileID, &task.Filename, &task.FileType, &task.FileSize)
+	`).Scan(&task.TaskID, &task.FileID, &task.FilePath, &task.Filename, &task.FileType, &task.FileSize)
 
 	if err == sql.ErrNoRows {
 		// No pending tasks
@@ -113,7 +114,7 @@ func (w *Worker) processNext(ctx context.Context) {
 	downloadCtx, cancel := context.WithTimeout(ctx, time.Duration(w.cfg.DownloadTimeoutSec)*time.Second)
 	defer cancel()
 
-	err = w.downloadFile(downloadCtx, task.TaskID, task.FileID, task.Filename)
+	err = w.downloadFile(downloadCtx, task.TaskID, task.FileID, task.FilePath, task.Filename)
 
 	if err != nil {
 		// Mark as FAILED
@@ -144,62 +145,37 @@ func (w *Worker) processNext(ctx context.Context) {
 	}
 }
 
-func (w *Worker) downloadFile(ctx context.Context, taskID int64, fileID, filename string) error {
-	// Get file from Telegram with retry logic
-	var file tgbotapi.File
-	var err error
+func (w *Worker) downloadFile(ctx context.Context, taskID int64, fileID, filePath, filename string) error {
+	// CRITICAL FIX: Use stored file_path from database instead of calling GetFile
+	// The file_path was already captured when the file was received by the bot
+	// This solves:
+	// 1. Local Bot API async download delays
+	// 2. File ID expiration issues
+	// 3. Eliminates duplicate GetFile() calls
 
-	maxRetries := 3
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		fileConfig := tgbotapi.FileConfig{FileID: fileID}
-		file, err = w.bot.GetFile(fileConfig)
-
-		if err == nil {
-			break // Success
-		}
-
-		w.logger.Warn("GetFile attempt failed",
-			zap.Int("attempt", attempt),
-			zap.Int64("task_id", taskID),
-			zap.String("file_id", fileID),
-			zap.Error(err))
-
-		if attempt < maxRetries {
-			// Exponential backoff: 2s, 4s
-			backoff := time.Duration(1<<uint(attempt)) * time.Second
-			w.logger.Info("Retrying GetFile after backoff",
-				zap.Duration("backoff", backoff))
-			time.Sleep(backoff)
-		}
-	}
-
-	if err != nil {
-		return fmt.Errorf("get file error after %d attempts: %w", maxRetries, err)
-	}
-
-	w.logger.Info("GetFile succeeded",
+	w.logger.Info("Using stored file_path for download",
 		zap.Int64("task_id", taskID),
-		zap.String("file_path", file.FilePath))
+		zap.String("file_path", filePath))
 
 	// Determine download URL
 	var fileURL string
 	if w.cfg.UseLocalBotAPI {
-		// For local Bot API, file.FilePath returns absolute path like:
+		// For local Bot API, filePath may be absolute path like:
 		// /var/lib/telegram-bot-api/BOT_TOKEN/documents/file.rar
 		// We need to extract the relative path: documents/file.rar
 
-		relativePath := file.FilePath
+		relativePath := filePath
 
 		// Check if it's an absolute path
-		if strings.HasPrefix(file.FilePath, "/") {
+		if strings.HasPrefix(filePath, "/") {
 			// Extract path after bot token directory
 			// Format: /var/lib/telegram-bot-api/{BOT_TOKEN}/documents/file.rar
-			parts := strings.Split(file.FilePath, "/")
+			parts := strings.Split(filePath, "/")
 
 			// Find the index where bot token appears (or use last 2-3 parts as fallback)
 			foundToken := false
 			for i, part := range parts {
-				if strings.Contains(part, ":") && strings.Contains(part, w.cfg.TelegramBotToken[:10]) {
+				if strings.Contains(part, ":") && len(w.cfg.TelegramBotToken) >= 10 && strings.Contains(part, w.cfg.TelegramBotToken[:10]) {
 					// Found bot token directory, take everything after it
 					if i+1 < len(parts) {
 						relativePath = strings.Join(parts[i+1:], "/")
@@ -217,13 +193,14 @@ func (w *Worker) downloadFile(ctx context.Context, taskID int64, fileID, filenam
 
 			w.logger.Info("Extracted relative path from absolute path",
 				zap.Int64("task_id", taskID),
-				zap.String("absolute_path", file.FilePath),
+				zap.String("absolute_path", filePath),
 				zap.String("relative_path", relativePath))
 		}
 
 		fileURL = fmt.Sprintf("%s/file/bot%s/%s", w.cfg.LocalBotAPIURL, w.cfg.TelegramBotToken, relativePath)
 	} else {
-		fileURL = file.Link(w.cfg.TelegramBotToken)
+		// For standard API, use the file_path as part of the download link
+		fileURL = fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", w.cfg.TelegramBotToken, filePath)
 	}
 
 	w.logger.Info("Download URL constructed",
