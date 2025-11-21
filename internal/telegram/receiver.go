@@ -442,7 +442,9 @@ func (r *Receiver) handleDocument(msg *tgbotapi.Message) {
 		return
 	}
 
-	// CRITICAL FIX: Call GetFile immediately to capture file_path
+	// CRITICAL FIX: Call GetFile immediately to capture file_path with retry logic
+	// The local Bot API server downloads files from Telegram asynchronously,
+	// so we need to retry until the file is available on the local server.
 	// This solves:
 	// 1. Local Bot API async download delays
 	// 2. File ID expiration issues
@@ -451,20 +453,47 @@ func (r *Receiver) handleDocument(msg *tgbotapi.Message) {
 		zap.String("file_id", doc.FileID),
 		zap.String("filename", doc.FileName))
 
+	var file tgbotapi.File
+	var err error
+	maxRetries := 5
+	retryDelays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
+
 	fileConfig := tgbotapi.FileConfig{FileID: doc.FileID}
-	file, err := r.bot.GetFile(fileConfig)
-	if err != nil {
-		r.logger.Error("GetFile failed when receiving file",
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		file, err = r.bot.GetFile(fileConfig)
+		if err == nil {
+			// Success!
+			r.logger.Info("GetFile succeeded, file_path captured",
+				zap.String("file_path", file.FilePath),
+				zap.String("filename", doc.FileName),
+				zap.Int("attempt", attempt+1))
+			break
+		}
+
+		// Check if this is the last attempt
+		if attempt == maxRetries {
+			r.logger.Error("GetFile failed after all retry attempts",
+				zap.Error(err),
+				zap.String("file_id", doc.FileID),
+				zap.String("filename", doc.FileName),
+				zap.Int("attempts", maxRetries+1))
+			r.sendReply(msg.Chat.ID, "❌ Error accessing file. The file may not be available on the server yet. Please try uploading again in a few moments.")
+			return
+		}
+
+		// Wait before retrying
+		delay := retryDelays[attempt]
+		r.logger.Warn("GetFile failed, retrying...",
 			zap.Error(err),
 			zap.String("file_id", doc.FileID),
-			zap.String("filename", doc.FileName))
-		r.sendReply(msg.Chat.ID, "❌ Error accessing file. Please try uploading again.")
-		return
-	}
+			zap.String("filename", doc.FileName),
+			zap.Int("attempt", attempt+1),
+			zap.Int("max_attempts", maxRetries+1),
+			zap.Duration("retry_delay", delay))
 
-	r.logger.Info("GetFile succeeded, file_path captured",
-		zap.String("file_path", file.FilePath),
-		zap.String("filename", doc.FileName))
+		time.Sleep(delay)
+	}
 
 	// Insert into download queue with file_path
 	taskID, err := r.enqueueDownload(msg.From.ID, doc.FileID, file.FilePath, doc.FileName, fileType, int64(doc.FileSize))
